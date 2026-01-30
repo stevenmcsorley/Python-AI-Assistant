@@ -5,7 +5,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .signals import NullSignalSource, SignalSource, SignalWriter
+from .signals import NullSignalSource, SignalSource, SignalWriter, SyntheticSignalSource
 
 import psycopg
 
@@ -62,8 +62,15 @@ class _ReadinessState:
 
 
 def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
-    signal_sources: list[SignalSource] = [NullSignalSource()]
     dsn = os.getenv("DATABASE_URL", "")
+    user_id = os.getenv("DEFAULT_USER_ID", "")
+    use_synthetic = os.getenv("INGEST_SYNTHETIC_SIGNALS", "false").lower() == "true"
+    if use_synthetic:
+        if not user_id:
+            raise SystemExit("DEFAULT_USER_ID is required when INGEST_SYNTHETIC_SIGNALS=true")
+        signal_sources: list[SignalSource] = [SyntheticSignalSource(user_id=user_id)]
+    else:
+        signal_sources = [NullSignalSource()]
 
     def ingest_signals() -> tuple[int, int]:
         writer = SignalWriter(dsn, actor_id="orchestrator")
