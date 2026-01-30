@@ -20,8 +20,12 @@ services:
       QUIET_HOURS: ${QUIET_HOURS:-"22:00-07:00"}
       BACKGROUND_POLL_INTERVAL: ${BACKGROUND_POLL_INTERVAL:-3600}
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./obsidian-vault:/obsidian
     restart: unless-stopped
@@ -42,8 +46,12 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./obsidian-vault:/obsidian
     restart: unless-stopped
@@ -126,6 +134,19 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
     restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      dockerfile: services/migrate/Dockerfile
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://assistant:assistant@postgres:5432/assistant}
+      MIGRATIONS_PATH: ${MIGRATIONS_PATH:-/app/migrations}
+      MIGRATE_DB_TIMEOUT_SECONDS: ${MIGRATE_DB_TIMEOUT_SECONDS:-60}
+      MIGRATE_DB_RETRY_SECONDS: ${MIGRATE_DB_RETRY_SECONDS:-2}
+    depends_on:
+      - postgres
+    restart: "no"
 
 volumes:
   postgres_data:
