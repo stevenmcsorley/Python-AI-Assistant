@@ -16,6 +16,7 @@ This repository is a build-ready skeleton based on the PRD and Runtime Architect
 
 ## Example Commands
 - Base services only: `docker compose up -d`
+- Run migrations only: `docker compose up migrate`
 - Local with Temporal + monitoring: `docker compose --profile local up -d`
 - Production-like (Temporal + Qdrant + monitoring): `docker compose --profile prod up -d`
 - Offline mode (Ollama): `docker compose --profile offline up -d`
