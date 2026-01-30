@@ -18,6 +18,19 @@ REQUIRED_TABLES = ("tasks", "task_attempts", "audit_log")
 LEASE_DURATION_SECONDS = 120
 LEASE_RENEW_SECONDS = 30
 
+STUB_TASK_TYPES = {
+    "fetch_sources",
+    "read_sources",
+    "synthesize",
+    "write_note",
+    "gather_context",
+    "research_context",
+    "write_brief",
+    "gather_goals",
+    "review_calendar",
+    "write_plan",
+}
+
 
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name)
@@ -216,11 +229,10 @@ def _claim_task(conn: psycopg.Connection, worker_id: str, logger: logging.Logger
                 WITH candidate AS (
                     SELECT task_id
                     FROM tasks
-                    WHERE task_type = 'noop'
-                      AND (
+                    WHERE (
                         status IN ('pending','scheduled')
                         OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < now())
-                      )
+                    )
                     ORDER BY updated_at NULLS LAST, created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -239,26 +251,6 @@ def _claim_task(conn: psycopg.Connection, worker_id: str, logger: logging.Logger
             )
             task = cur.fetchone()
             if not task:
-                cur.execute(
-                    """
-                    SELECT task_id, task_type
-                    FROM tasks
-                    WHERE task_type != 'noop'
-                      AND (
-                        status IN ('pending','scheduled')
-                        OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < now())
-                      )
-                    ORDER BY updated_at NULLS LAST, created_at ASC
-                    LIMIT 1
-                    """
-                )
-                non_noop = cur.fetchone()
-                if non_noop:
-                    logger.warning(
-                        "non-noop task present; skipping (task_id=%s task_type=%s)",
-                        non_noop["task_id"],
-                        non_noop["task_type"],
-                    )
                 return None
 
             ts_claim = datetime.now(timezone.utc)
@@ -421,7 +413,59 @@ def _mark_failed(
                 )
 
 
-def _complete_task_and_advance(conn: psycopg.Connection, worker_id: str, task: dict, logger: logging.Logger) -> None:
+def _mark_task_failed_only(
+    conn: psycopg.Connection,
+    worker_id: str,
+    task: dict,
+    error_details: str,
+) -> None:
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tasks
+                SET status = 'failed',
+                    error_details = %s,
+                    completed_at = now(),
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+                WHERE task_id = %s
+                """,
+                (error_details, task["task_id"]),
+            )
+            cur.execute(
+                """
+                UPDATE task_attempts
+                SET status = 'failed',
+                    ended_at = now(),
+                    error_details = %s
+                WHERE task_id = %s
+                  AND attempt_number = %s
+                """,
+                (error_details, task["task_id"], task["attempts"]),
+            )
+            _audit(
+                cur,
+                worker_id,
+                "task_failed",
+                "task",
+                str(task["task_id"]),
+                str(task["workflow_id"]) if task["workflow_id"] else None,
+                str(task["step_id"]) if task["step_id"] else None,
+                str(task["task_id"]),
+                {"error": error_details},
+            )
+
+
+def _complete_task_and_advance(
+    conn: psycopg.Connection,
+    worker_id: str,
+    task: dict,
+    logger: logging.Logger,
+    output_json: dict | None = None,
+) -> None:
+    payload = output_json if output_json is not None else {"status": "ok"}
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
@@ -435,7 +479,7 @@ def _complete_task_and_advance(conn: psycopg.Connection, worker_id: str, task: d
                     updated_at = now()
                 WHERE task_id = %s
                 """,
-                (Json({"status": "ok"}), task["task_id"]),
+                (Json(payload), task["task_id"]),
             )
             cur.execute(
                 """
@@ -662,22 +706,35 @@ def _execute_noop(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
             next_renew = time.monotonic() + LEASE_RENEW_SECONDS
 
 
+def _execute_stub(task: dict, logger: logging.Logger) -> dict:
+    logger.info("stub handler executed (task_id=%s task_type=%s)", task["task_id"], task["task_type"])
+    return {
+        "stub": True,
+        "task_type": task["task_type"],
+        "note": "stub execution only",
+    }
+
+
 def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: logging.Logger) -> None:
     if task["attempts"] > task["max_attempts"]:
         _mark_failed(conn, worker_id, task, "max_attempts_exceeded")
         return
 
-    if task["task_type"] != "noop":
-        logger.warning(
-            "skipping non-noop task (task_id=%s task_type=%s)",
-            task["task_id"],
-            task["task_type"],
-        )
+    task_type = task["task_type"]
+    if task_type == "noop":
+        _execute_noop(conn, worker_id, task)
+        _complete_task_and_advance(conn, worker_id, task, logger)
+        logger.info("task completed (task_id=%s)", task["task_id"])
         return
 
-    _execute_noop(conn, worker_id, task)
-    _complete_task_and_advance(conn, worker_id, task, logger)
-    logger.info("task completed (task_id=%s)", task["task_id"])
+    if task_type in STUB_TASK_TYPES:
+        output = _execute_stub(task, logger)
+        _complete_task_and_advance(conn, worker_id, task, logger, output_json=output)
+        logger.info("task completed (task_id=%s)", task["task_id"])
+        return
+
+    logger.error("unknown task_type encountered (task_id=%s task_type=%s)", task["task_id"], task_type)
+    _mark_task_failed_only(conn, worker_id, task, "unknown_task_type")
 
 
 def main() -> None:
