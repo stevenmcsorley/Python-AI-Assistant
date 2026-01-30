@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 
 import psycopg
+import requests
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
@@ -19,6 +20,8 @@ from psycopg.types.json import Json
 REQUIRED_TABLES = ("tasks", "task_attempts", "audit_log")
 LEASE_DURATION_SECONDS = 120
 LEASE_RENEW_SECONDS = 30
+MAX_WEB_FETCH_BYTES = 256 * 1024
+WEB_FETCH_TIMEOUT_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -807,13 +810,16 @@ def _plan_tool_invocation(
     task: dict,
     tool: Tool,
     logger: logging.Logger,
-) -> None:
+) -> tuple[str, str, dict]:
     payload = {
         "task_id": str(task["task_id"]),
         "task_type": task["task_type"],
         "tool_name": tool.name,
     }
+    if tool.name == "web_fetch":
+        payload["url"] = os.getenv("WEB_FETCH_URL", "https://example.com")
     input_ref = json.dumps(payload, sort_keys=True)
+    sandbox_type = os.getenv("TOOL_SANDBOX_TYPE", "none").lower()
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
@@ -826,11 +832,11 @@ def _plan_tool_invocation(
                     input_ref,
                     output_ref
                 ) VALUES (
-                    %s, %s, 'none', %s, %s, NULL
+                    %s, %s, %s, %s, %s, NULL
                 )
                 RETURNING tool_exec_id
                 """,
-                (task["task_id"], tool.name, "running", input_ref),
+                (task["task_id"], tool.name, sandbox_type, "running", input_ref),
             )
             tool_exec_id = cur.fetchone()[0]
             _audit(
@@ -844,11 +850,142 @@ def _plan_tool_invocation(
                 str(task["task_id"]),
                 {"tool_name": tool.name, "tool_exec_id": str(tool_exec_id)},
             )
-    logger.info(
-        "tool planned (task_id=%s tool_name=%s)",
-        task["task_id"],
-        tool.name,
-    )
+    logger.info("tool planned (task_id=%s tool_name=%s)", task["task_id"], tool.name)
+    return str(tool_exec_id), sandbox_type, payload
+
+
+def _execute_web_fetch(
+    conn: psycopg.Connection,
+    worker_id: str,
+    task: dict,
+    planned_tool_exec_id: str,
+    input_payload: dict,
+    logger: logging.Logger,
+) -> None:
+    url = input_payload.get("url")
+    if not isinstance(url, str) or not url:
+        _record_tool_execution_result(
+            conn,
+            worker_id,
+            task,
+            planned_tool_exec_id,
+            status="failed",
+            output_metadata={"error_details": "missing_url"},
+            exit_code=1,
+            input_payload=input_payload,
+        )
+        return
+    try:
+        response = requests.get(
+            url,
+            timeout=WEB_FETCH_TIMEOUT_SECONDS,
+            allow_redirects=False,
+            stream=True,
+        )
+        content_length_header = response.headers.get("Content-Length")
+        if content_length_header is not None:
+            try:
+                content_length_val = int(content_length_header)
+            except ValueError as exc:
+                raise ValueError("invalid_content_length") from exc
+            if content_length_val > MAX_WEB_FETCH_BYTES:
+                raise ValueError("response_too_large")
+
+        bytes_read = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            bytes_read += len(chunk)
+            if bytes_read > MAX_WEB_FETCH_BYTES:
+                raise ValueError("response_too_large")
+
+        metadata = {
+            "status_code": response.status_code,
+            "content_length": bytes_read,
+            "content_type": response.headers.get("Content-Type"),
+        }
+        _record_tool_execution_result(
+            conn,
+            worker_id,
+            task,
+            planned_tool_exec_id,
+            status="completed",
+            output_metadata=metadata,
+            exit_code=0,
+            input_payload=input_payload,
+        )
+        logger.info("tool executed (task_id=%s tool_name=web_fetch)", task["task_id"])
+    except Exception as exc:
+        _record_tool_execution_result(
+            conn,
+            worker_id,
+            task,
+            planned_tool_exec_id,
+            status="failed",
+            output_metadata={"error_details": str(exc)},
+            exit_code=1,
+            input_payload=input_payload,
+        )
+        logger.error(
+            "tool execution failed (task_id=%s tool_name=web_fetch error=%s)",
+            task["task_id"],
+            exc,
+        )
+
+
+def _record_tool_execution_result(
+    conn: psycopg.Connection,
+    worker_id: str,
+    task: dict,
+    planned_tool_exec_id: str,
+    status: str,
+    output_metadata: dict,
+    exit_code: int,
+    input_payload: dict,
+) -> None:
+    payload = dict(output_metadata)
+    payload["planned_tool_exec_id"] = planned_tool_exec_id
+    input_ref = json.dumps(input_payload, sort_keys=True)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tool_executions (
+                    task_id,
+                    tool_name,
+                    sandbox_type,
+                    status,
+                    input_ref,
+                    output_ref,
+                    started_at,
+                    ended_at,
+                    exit_code
+                ) VALUES (
+                    %s, %s, 'local', %s, %s, %s, now(), now(), %s
+                )
+                RETURNING tool_exec_id
+                """,
+                (
+                    task["task_id"],
+                    "web_fetch",
+                    status,
+                    input_ref,
+                    json.dumps(payload, sort_keys=True),
+                    exit_code,
+                ),
+            )
+            tool_exec_id = cur.fetchone()[0]
+            _audit(
+                cur,
+                worker_id,
+                "tool_executed",
+                "tool_execution",
+                str(tool_exec_id),
+                str(task["workflow_id"]) if task["workflow_id"] else None,
+                str(task["step_id"]) if task["step_id"] else None,
+                str(task["task_id"]),
+                {"planned_tool_exec_id": planned_tool_exec_id, "tool_exec_id": str(tool_exec_id)},
+            )
 
 
 def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: logging.Logger) -> None:
@@ -874,7 +1011,11 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
             logger.error("tool not registered (task_id=%s tool_name=%s)", task["task_id"], tool_name)
             _mark_task_failed_only(conn, worker_id, task, "tool_not_registered")
             return
-        _plan_tool_invocation(conn, worker_id, task, tool, logger)
+        tool_exec_id, sandbox_type, input_payload = _plan_tool_invocation(
+            conn, worker_id, task, tool, logger
+        )
+        if tool.name == "web_fetch" and sandbox_type == "local":
+            _execute_web_fetch(conn, worker_id, task, tool_exec_id, input_payload, logger)
         output = _execute_stub(task, logger)
         _complete_task_and_advance(conn, worker_id, task, logger, output_json=output)
         logger.info("task completed (task_id=%s)", task["task_id"])
