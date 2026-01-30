@@ -9,10 +9,13 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psycopg
+from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 
 REQUIRED_TABLES = ("tasks", "task_attempts", "audit_log")
+LEASE_DURATION_SECONDS = 120
+LEASE_RENEW_SECONDS = 30
 
 
 def _env_int(name: str, default: int) -> int:
@@ -145,6 +148,431 @@ def _recovery_scan(conn: psycopg.Connection, logger: logging.Logger) -> None:
     logger.info("recovery scan: reclaimable task_ids=%s", ",".join(task_ids))
 
 
+def _audit(
+    cur: psycopg.Cursor,
+    actor_id: str,
+    action_type: str,
+    entity_type: str,
+    entity_id: str | None,
+    workflow_id: str | None,
+    step_id: str | None,
+    task_id: str | None,
+    metadata: dict | None = None,
+) -> None:
+    digest = hashlib.sha256(
+        f"{actor_id}:{action_type}:{entity_type}:{entity_id}:{time.time_ns()}".encode("utf-8")
+    ).hexdigest()
+    cur.execute(
+        """
+        INSERT INTO audit_log (
+            actor_type,
+            actor_id,
+            action_type,
+            entity_type,
+            entity_id,
+            workflow_id,
+            step_id,
+            task_id,
+            audit_hash,
+            metadata
+        ) VALUES (
+            'worker',
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        )
+        """,
+        (
+            actor_id,
+            action_type,
+            entity_type,
+            entity_id,
+            workflow_id,
+            step_id,
+            task_id,
+            digest,
+            Json(metadata or {}),
+        ),
+    )
+
+
+def _claim_task(conn: psycopg.Connection, worker_id: str) -> dict | None:
+    with conn.transaction():
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                WITH candidate AS (
+                    SELECT task_id
+                    FROM tasks
+                    WHERE (
+                        status IN ('pending','scheduled')
+                        OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < now())
+                    )
+                    ORDER BY updated_at NULLS LAST, created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE tasks
+                SET status = 'running',
+                    lease_owner = %s,
+                    lease_expires_at = now() + (%s || ' seconds')::interval,
+                    attempts = attempts + 1,
+                    started_at = COALESCE(started_at, now()),
+                    updated_at = now()
+                WHERE task_id IN (SELECT task_id FROM candidate)
+                RETURNING *
+                """,
+                (worker_id, LEASE_DURATION_SECONDS),
+            )
+            task = cur.fetchone()
+            if not task:
+                return None
+
+            attempt_number = task["attempts"]
+            cur.execute(
+                """
+                INSERT INTO task_attempts (
+                    task_id,
+                    attempt_number,
+                    status,
+                    worker_id,
+                    started_at
+                ) VALUES (%s, %s, 'running', %s, now())
+                """,
+                (task["task_id"], attempt_number, worker_id),
+            )
+            _audit(
+                cur,
+                worker_id,
+                "task_claimed",
+                "task",
+                str(task["task_id"]),
+                str(task["workflow_id"]) if task["workflow_id"] else None,
+                str(task["step_id"]) if task["step_id"] else None,
+                str(task["task_id"]),
+            )
+            _audit(
+                cur,
+                worker_id,
+                "task_started",
+                "task",
+                str(task["task_id"]),
+                str(task["workflow_id"]) if task["workflow_id"] else None,
+                str(task["step_id"]) if task["step_id"] else None,
+                str(task["task_id"]),
+            )
+            return task
+
+
+def _renew_lease(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tasks
+                SET lease_expires_at = now() + (%s || ' seconds')::interval,
+                    updated_at = now()
+                WHERE task_id = %s
+                  AND lease_owner = %s
+                  AND status = 'running'
+                """,
+                (LEASE_DURATION_SECONDS, task["task_id"], worker_id),
+            )
+            _audit(
+                cur,
+                worker_id,
+                "lease_renewed",
+                "task",
+                str(task["task_id"]),
+                str(task["workflow_id"]) if task["workflow_id"] else None,
+                str(task["step_id"]) if task["step_id"] else None,
+                str(task["task_id"]),
+            )
+
+
+def _mark_failed(
+    conn: psycopg.Connection,
+    worker_id: str,
+    task: dict,
+    error_details: str,
+) -> None:
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tasks
+                SET status = 'failed',
+                    error_details = %s,
+                    completed_at = now(),
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+                WHERE task_id = %s
+                """,
+                (error_details, task["task_id"]),
+            )
+            cur.execute(
+                """
+                UPDATE task_attempts
+                SET status = 'failed',
+                    ended_at = now(),
+                    error_details = %s
+                WHERE task_id = %s
+                  AND attempt_number = %s
+                """,
+                (error_details, task["task_id"], task["attempts"]),
+            )
+            _audit(
+                cur,
+                worker_id,
+                "task_failed",
+                "task",
+                str(task["task_id"]),
+                str(task["workflow_id"]) if task["workflow_id"] else None,
+                str(task["step_id"]) if task["step_id"] else None,
+                str(task["task_id"]),
+                {"error": error_details},
+            )
+
+            if task["step_id"] is not None:
+                cur.execute(
+                    """
+                    UPDATE workflow_steps
+                    SET status = 'failed',
+                        completed_at = now(),
+                        error_details = %s,
+                        updated_at = now()
+                    WHERE step_id = %s
+                    """,
+                    (error_details, task["step_id"]),
+                )
+                _audit(
+                    cur,
+                    worker_id,
+                    "workflow_step_failed",
+                    "workflow_step",
+                    str(task["step_id"]),
+                    str(task["workflow_id"]) if task["workflow_id"] else None,
+                    str(task["step_id"]),
+                    str(task["task_id"]),
+                )
+
+            if task["workflow_id"] is not None:
+                cur.execute(
+                    """
+                    UPDATE workflows
+                    SET status = 'failed',
+                        completed_at = now(),
+                        error_details = %s,
+                        updated_at = now()
+                    WHERE workflow_id = %s
+                    """,
+                    (error_details, task["workflow_id"]),
+                )
+                _audit(
+                    cur,
+                    worker_id,
+                    "workflow_failed",
+                    "workflow",
+                    str(task["workflow_id"]),
+                    str(task["workflow_id"]),
+                    str(task["step_id"]) if task["step_id"] else None,
+                    str(task["task_id"]),
+                )
+
+
+def _complete_task_and_advance(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tasks
+                SET status = 'completed',
+                    output_json = %s,
+                    completed_at = now(),
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+                WHERE task_id = %s
+                """,
+                (Json({"status": "ok"}), task["task_id"]),
+            )
+            cur.execute(
+                """
+                UPDATE task_attempts
+                SET status = 'completed',
+                    ended_at = now()
+                WHERE task_id = %s
+                  AND attempt_number = %s
+                """,
+                (task["task_id"], task["attempts"]),
+            )
+            _audit(
+                cur,
+                worker_id,
+                "task_completed",
+                "task",
+                str(task["task_id"]),
+                str(task["workflow_id"]) if task["workflow_id"] else None,
+                str(task["step_id"]) if task["step_id"] else None,
+                str(task["task_id"]),
+            )
+
+            if task["step_id"] is None or task["workflow_id"] is None:
+                return
+
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM tasks
+                WHERE step_id = %s AND status != 'completed'
+                """,
+                (task["step_id"],),
+            )
+            remaining = cur.fetchone()[0]
+            if remaining != 0:
+                return
+
+            cur.execute(
+                """
+                UPDATE workflow_steps
+                SET status = 'completed',
+                    completed_at = now(),
+                    updated_at = now()
+                WHERE step_id = %s
+                RETURNING step_index, step_key
+                """,
+                (task["step_id"],),
+            )
+            row = cur.fetchone()
+            if not row:
+                return
+            step_index, step_key = row
+            _audit(
+                cur,
+                worker_id,
+                "workflow_step_completed",
+                "workflow_step",
+                str(task["step_id"]),
+                str(task["workflow_id"]),
+                str(task["step_id"]),
+                str(task["task_id"]),
+            )
+
+            cur.execute(
+                """
+                SELECT step_id FROM workflow_steps
+                WHERE workflow_id = %s AND step_index > %s
+                ORDER BY step_index ASC
+                LIMIT 1
+                """,
+                (task["workflow_id"], step_index),
+            )
+            next_step = cur.fetchone()
+
+            cur.execute(
+                """
+                INSERT INTO workflow_checkpoints (
+                    workflow_id,
+                    step_name,
+                    state_json,
+                    created_by
+                ) VALUES (%s, %s, %s, %s)
+                RETURNING checkpoint_id
+                """,
+                (task["workflow_id"], step_key, Json({"completed_step_id": str(task["step_id"])}), worker_id),
+            )
+            checkpoint_id = cur.fetchone()[0]
+            _audit(
+                cur,
+                worker_id,
+                "workflow_checkpointed",
+                "workflow",
+                str(task["workflow_id"]),
+                str(task["workflow_id"]),
+                str(task["step_id"]),
+                str(task["task_id"]),
+            )
+
+            if next_step is None:
+                cur.execute(
+                    """
+                    UPDATE workflows
+                    SET status = 'completed',
+                        completed_at = now(),
+                        checkpoint_id = %s,
+                        updated_at = now()
+                    WHERE workflow_id = %s
+                    """,
+                    (checkpoint_id, task["workflow_id"]),
+                )
+                _audit(
+                    cur,
+                    worker_id,
+                    "workflow_completed",
+                    "workflow",
+                    str(task["workflow_id"]),
+                    str(task["workflow_id"]),
+                    str(task["step_id"]),
+                    str(task["task_id"]),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE workflows
+                    SET current_step_id = %s,
+                        checkpoint_id = %s,
+                        updated_at = now()
+                    WHERE workflow_id = %s
+                    """,
+                    (next_step[0], checkpoint_id, task["workflow_id"]),
+                )
+                _audit(
+                    cur,
+                    worker_id,
+                    "workflow_advanced",
+                    "workflow",
+                    str(task["workflow_id"]),
+                    str(task["workflow_id"]),
+                    str(task["step_id"]),
+                    str(task["task_id"]),
+                    {"next_step_id": str(next_step[0])},
+                )
+
+
+def _execute_noop(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
+    duration = _env_int("NOOP_DURATION_SECONDS", 2)
+    start_time = time.monotonic()
+    next_renew = start_time + LEASE_RENEW_SECONDS
+    while True:
+        elapsed = time.monotonic() - start_time
+        if elapsed >= duration:
+            break
+        time.sleep(min(0.5, duration - elapsed))
+        if time.monotonic() >= next_renew:
+            _renew_lease(conn, worker_id, task)
+            next_renew = time.monotonic() + LEASE_RENEW_SECONDS
+
+
+def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: logging.Logger) -> None:
+    if task["attempts"] > task["max_attempts"]:
+        _mark_failed(conn, worker_id, task, "max_attempts_exceeded")
+        return
+
+    if task["task_type"] != "noop":
+        _mark_failed(conn, worker_id, task, "unsupported_task_type")
+        return
+
+    _execute_noop(conn, worker_id, task)
+    _complete_task_and_advance(conn, worker_id, task)
+    logger.info("task completed (task_id=%s)", task["task_id"])
+
+
 def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
     logger = logging.getLogger("worker")
@@ -210,13 +638,39 @@ def main() -> None:
     logger.info("readiness state: %s (%s)", state, message)
     last_ready = ready
 
-    while not stop_event.wait(readiness_interval):
-        ready, message = check_readiness()
-        readiness.set(ready, message)
-        if last_ready != ready:
-            state = "READY" if ready else "NOT READY"
-            logger.info("readiness state: %s (%s)", state, message)
-            last_ready = ready
+    poll_interval = _env_int("WORKER_POLL_SECONDS", 5)
+    last_ready_check = 0.0
+
+    while not stop_event.is_set():
+        now = time.monotonic()
+        if now - last_ready_check >= readiness_interval:
+            ready, message = check_readiness()
+            readiness.set(ready, message)
+            if last_ready != ready:
+                state = "READY" if ready else "NOT READY"
+                logger.info("readiness state: %s (%s)", state, message)
+                last_ready = ready
+            last_ready_check = now
+
+        if readiness.get()[0]:
+            try:
+                task = _claim_task(conn, worker_id) if conn is not None else None
+            except Exception as exc:
+                logger.error("task claim failed: %s", exc)
+                task = None
+
+            if task is not None:
+                try:
+                    _process_task(conn, worker_id, task, logger)
+                except Exception as exc:
+                    logger.error("task execution failed: %s", exc)
+                    try:
+                        _mark_failed(conn, worker_id, task, f"execution_error: {exc}")
+                    except Exception as inner_exc:
+                        logger.error("failed to mark task failed: %s", inner_exc)
+                continue
+
+        stop_event.wait(poll_interval)
 
     logger.info("shutting down")
     httpd.shutdown()
