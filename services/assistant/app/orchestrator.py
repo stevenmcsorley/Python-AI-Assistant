@@ -10,6 +10,7 @@ from .signals import NullSignalSource, SignalSource, SignalWriter, SyntheticSign
 from .intents import IntentWriter, RuleBasedIntentClassifier
 from .suggestions import RuleBasedSuggestionGenerator, SuggestionWriter
 from .approvals import Approval, ApprovalWriter
+from .messages import Message, MessageWriter
 from .workflows import WorkflowFactory, WorkflowStepPlanner, plan_pending_workflows
 from .tasks import TaskPlanner, plan_pending_tasks
 
@@ -131,6 +132,7 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                     intent_writer = IntentWriter(dsn, actor_id="orchestrator")
                     suggestion_generator = RuleBasedSuggestionGenerator()
                     suggestion_writer = SuggestionWriter(dsn, actor_id="orchestrator")
+                    message_writer = MessageWriter(dsn, actor_id="orchestrator", actor_type="orchestrator")
                     for signal, signal_id in new_signals:
                         intents = classifier.classify(signal, signal_id=signal_id)
                         intents_processed += len(intents)
@@ -140,9 +142,19 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                                 intents_created += 1
                             suggestion = suggestion_generator.generate(intent, intent_id, signal)
                             if suggestion is not None:
-                                _, suggestion_created = suggestion_writer.write(suggestion)
+                                suggestion_id, suggestion_created = suggestion_writer.write(suggestion)
                                 if suggestion_created:
                                     suggestions_created += 1
+                                    message = Message(
+                                        user_id=suggestion.user_id,
+                                        channel="whatsapp",
+                                        message_type="suggestion_ready",
+                                        body="I found something you may want to review. Would you like me to proceed?",
+                                        status="queued",
+                                        related_entity_type="suggestion",
+                                        related_entity_id=str(suggestion_id),
+                                    )
+                                    message_writer.write(message)
                 self.send_response(200)
                 self.end_headers()
                 logger = logging.getLogger("orchestrator")
@@ -300,6 +312,19 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                                     suggestion_id=str(row[0]),
                                     suggestion_type=str(suggestion_type),
                                 )
+                                message_writer = MessageWriter(
+                                    dsn, actor_id="orchestrator", actor_type="orchestrator"
+                                )
+                                message = Message(
+                                    user_id=str(row[1]),
+                                    channel="whatsapp",
+                                    message_type="workflow_started",
+                                    body="I've started preparing this for you. I'll update you when there's something to review.",
+                                    status="queued",
+                                    related_entity_type="workflow",
+                                    related_entity_id=workflow_id,
+                                )
+                                message_writer.write(message, cur=cur)
                             cur.execute(
                                 """
                                 UPDATE suggestions

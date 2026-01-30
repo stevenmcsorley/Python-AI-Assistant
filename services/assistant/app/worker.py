@@ -17,6 +17,7 @@ import requests
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from .messages import Message, MessageWriter
 
 REQUIRED_TABLES = ("tasks", "task_attempts", "audit_log")
 LEASE_DURATION_SECONDS = 120
@@ -866,7 +867,7 @@ def _write_obsidian_note(
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            SELECT w.type, w.completed_at, wo.output_json, wo.created_at
+            SELECT w.type, w.completed_at, w.user_id, wo.output_json, wo.created_at
             FROM workflow_outputs wo
             JOIN workflows w ON w.workflow_id = wo.workflow_id
             WHERE wo.workflow_id = %s
@@ -880,6 +881,7 @@ def _write_obsidian_note(
 
     workflow_type = row["type"]
     completed_at = row["completed_at"]
+    user_id = row["user_id"]
     created_at = row["created_at"] or completed_at or datetime.now(timezone.utc)
     output_json = row["output_json"]
     if isinstance(output_json, str):
@@ -918,6 +920,17 @@ def _write_obsidian_note(
                 None,
                 {"file_path": file_path, "workflow_output_id": workflow_output_id},
             )
+            message_writer = MessageWriter("", actor_id=worker_id, actor_type="worker")
+            message = Message(
+                user_id=str(user_id),
+                channel="whatsapp",
+                message_type="workflow_completed",
+                body="Your preparation is ready. I've created a draft note for you.",
+                status="queued",
+                related_entity_type="workflow",
+                related_entity_id=workflow_id,
+            )
+            message_writer.write(message, cur=cur)
     logger.info("obsidian note created (workflow_id=%s path=%s)", workflow_id, file_path)
 
 
