@@ -10,7 +10,7 @@ from .signals import NullSignalSource, SignalSource, SignalWriter, SyntheticSign
 from .intents import IntentWriter, RuleBasedIntentClassifier
 from .suggestions import RuleBasedSuggestionGenerator, SuggestionWriter
 from .approvals import Approval, ApprovalWriter
-from .workflows import WorkflowFactory
+from .workflows import WorkflowFactory, WorkflowStepPlanner, plan_pending_workflows
 
 import psycopg
 
@@ -244,6 +244,19 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                                     self.end_headers()
                                     self.wfile.write(str(exc).encode("utf-8"))
                                     return
+                                planner = WorkflowStepPlanner(actor_id="orchestrator")
+                                try:
+                                    planner.ensure_steps(
+                                        cur,
+                                        workflow_id=workflow_id,
+                                        workflow_type=str(row[4]),
+                                        workflow_status="pending",
+                                    )
+                                except ValueError as exc:
+                                    self.send_response(400)
+                                    self.end_headers()
+                                    self.wfile.write(str(exc).encode("utf-8"))
+                                    return
                             approval = Approval(
                                 user_id=str(row[1]),
                                 suggestion_id=str(row[0]),
@@ -337,6 +350,14 @@ def main() -> None:
     state = "READY" if ready else "NOT READY"
     logger.info("readiness state: %s (%s)", state, message)
     last_ready = ready
+    if ready:
+        planned, steps_created = plan_pending_workflows(dsn, actor_id="orchestrator")
+        if planned:
+            logger.info(
+                "workflow step planning: workflows_planned=%s steps_created=%s",
+                planned,
+                steps_created,
+            )
 
     while not stop_event.wait(readiness_interval):
         ready, message = _check_db_ready(dsn)
