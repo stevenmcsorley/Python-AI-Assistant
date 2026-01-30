@@ -637,6 +637,49 @@ def _complete_task_and_advance(
             )
             logger.info("workflow step completed (step_id=%s)", task["step_id"])
 
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM workflow_steps
+                WHERE workflow_id = %s AND status != 'completed'
+                """,
+                (task["workflow_id"],),
+            )
+            remaining_steps = cur.fetchone()[0]
+            if remaining_steps == 0:
+                cur.execute(
+                    """
+                    UPDATE workflows
+                    SET status = 'completed',
+                        completed_at = now(),
+                        updated_at = now()
+                    WHERE workflow_id = %s
+                      AND status IN ('pending','running')
+                    RETURNING workflow_id
+                    """,
+                    (task["workflow_id"],),
+                )
+                if cur.fetchone():
+                    cur.execute(
+                        """
+                        SELECT COUNT(*) FROM workflow_steps
+                        WHERE workflow_id = %s
+                        """,
+                        (task["workflow_id"],),
+                    )
+                    step_count = cur.fetchone()[0]
+                    _audit(
+                        cur,
+                        worker_id,
+                        "workflow_completed",
+                        "workflow",
+                        str(task["workflow_id"]),
+                        str(task["workflow_id"]),
+                        str(task["step_id"]),
+                        str(task["task_id"]),
+                        {"final_step_id": str(task["step_id"]), "step_count": step_count},
+                    )
+                    logger.info("workflow completed (workflow_id=%s)", task["workflow_id"])
+
 
 def _execute_noop(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
     duration = _env_int("NOOP_DURATION_SECONDS", 2)
