@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -555,6 +556,8 @@ def _complete_task_and_advance(
     output_json: dict | None = None,
 ) -> None:
     payload = output_json if output_json is not None else {"status": "ok"}
+    workflow_completed = False
+    workflow_id = None
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
@@ -679,12 +682,11 @@ def _complete_task_and_advance(
                         {"final_step_id": str(task["step_id"]), "step_count": step_count},
                     )
                     logger.info("workflow completed (workflow_id=%s)", task["workflow_id"])
-                    _create_workflow_output(
-                        cur,
-                        worker_id,
-                        str(task["workflow_id"]),
-                        logger,
-                    )
+                    workflow_completed = True
+                    workflow_id = str(task["workflow_id"])
+
+    if workflow_completed and workflow_id:
+        _finalize_workflow_output_and_note(conn, worker_id, workflow_id, logger)
 
 
 def _execute_noop(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
@@ -711,98 +713,223 @@ def _execute_stub(task: dict, logger: logging.Logger) -> dict:
 
 
 def _create_workflow_output(
-    cur: psycopg.Cursor,
+    conn: psycopg.Connection,
+    worker_id: str,
+    workflow_id: str,
+    logger: logging.Logger,
+) -> str | None:
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.workflow_outputs')")
+            if cur.fetchone()[0] is None:
+                logger.warning("workflow_outputs table missing; skipping output aggregation")
+                return None
+
+            cur.execute(
+                """
+                SELECT workflow_output_id
+                FROM workflow_outputs
+                WHERE workflow_id = %s
+                LIMIT 1
+                """,
+                (workflow_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return str(row[0])
+
+            cur.execute(
+                """
+                SELECT type, completed_at
+                FROM workflows
+                WHERE workflow_id = %s
+                """,
+                (workflow_id,),
+            )
+            workflow_row = cur.fetchone()
+            if not workflow_row:
+                return None
+            workflow_type, completed_at = workflow_row
+
+            cur.execute(
+                """
+                SELECT step_id, step_key
+                FROM workflow_steps
+                WHERE workflow_id = %s
+                ORDER BY step_index ASC
+                """,
+                (workflow_id,),
+            )
+            steps = []
+            task_count = 0
+            for step_id, step_key in cur.fetchall():
+                cur.execute(
+                    """
+                    SELECT task_type, output_json
+                    FROM tasks
+                    WHERE step_id = %s
+                    ORDER BY created_at ASC
+                    """,
+                    (step_id,),
+                )
+                task_rows = cur.fetchall()
+                task_count += len(task_rows)
+                tasks = [
+                    {"task_type": task_type, "output_json": output_json}
+                    for task_type, output_json in task_rows
+                ]
+                steps.append({"step_key": step_key, "tasks": tasks})
+
+            output = {
+                "workflow_id": workflow_id,
+                "workflow_type": workflow_type,
+                "completed_at": completed_at.isoformat() if completed_at else None,
+                "steps": steps,
+                "summary": {"step_count": len(steps), "task_count": task_count},
+            }
+
+            cur.execute(
+                """
+                INSERT INTO workflow_outputs (
+                    workflow_id,
+                    output_json,
+                    created_at
+                ) VALUES (%s, %s, now())
+                RETURNING workflow_output_id
+                """,
+                (workflow_id, Json(output)),
+            )
+            workflow_output_id = cur.fetchone()[0]
+            _audit(
+                cur,
+                worker_id,
+                "workflow_output_created",
+                "workflow_output",
+                str(workflow_output_id),
+                workflow_id,
+                None,
+                None,
+            )
+            return str(workflow_output_id)
+
+
+def _render_obsidian_note(
+    workflow_type: str,
+    workflow_id: str,
+    created_at: datetime,
+    summary: dict,
+) -> str:
+    summary_json = json.dumps(summary, indent=2, sort_keys=True)
+    title = f"{workflow_type} - {workflow_id}"
+    return (
+        "---\n"
+        "status: draft\n"
+        "---\n\n"
+        f"# {title}\n\n"
+        f"Workflow Type: {workflow_type}\n\n"
+        f"Created: {created_at.isoformat()}\n\n"
+        "## Summary (JSON)\n\n"
+        "```json\n"
+        f"{summary_json}\n"
+        "```\n"
+    )
+
+
+def _atomic_write(path: str, content: str) -> None:
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".md", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _write_obsidian_note(
+    conn: psycopg.Connection,
+    worker_id: str,
+    workflow_id: str,
+    workflow_output_id: str,
+    logger: logging.Logger,
+) -> None:
+    vault_path = os.getenv("OBSIDIAN_VAULT_PATH")
+    if not vault_path:
+        logger.warning("OBSIDIAN_VAULT_PATH not set; skipping note creation")
+        return
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT w.type, w.completed_at, wo.output_json, wo.created_at
+            FROM workflow_outputs wo
+            JOIN workflows w ON w.workflow_id = wo.workflow_id
+            WHERE wo.workflow_id = %s
+            """,
+            (workflow_id,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return
+
+    workflow_type = row["type"]
+    completed_at = row["completed_at"]
+    created_at = row["created_at"] or completed_at or datetime.now(timezone.utc)
+    output_json = row["output_json"]
+    if isinstance(output_json, str):
+        try:
+            output_json = json.loads(output_json)
+        except json.JSONDecodeError:
+            output_json = {}
+    summary = {}
+    if isinstance(output_json, dict):
+        summary = output_json.get("summary") or {}
+
+    file_date = (completed_at or created_at or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+    filename = f"{file_date} -- {workflow_type} -- {workflow_id}.md"
+    file_path = os.path.join(vault_path, filename)
+
+    if os.path.exists(file_path):
+        return
+
+    note_content = _render_obsidian_note(workflow_type, workflow_id, created_at, summary)
+    try:
+        _atomic_write(file_path, note_content)
+    except Exception as exc:
+        logger.error("failed to write obsidian note (workflow_id=%s error=%s)", workflow_id, exc)
+        return
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            _audit(
+                cur,
+                worker_id,
+                "obsidian_note_created",
+                "workflow",
+                workflow_id,
+                workflow_id,
+                None,
+                None,
+                {"file_path": file_path, "workflow_output_id": workflow_output_id},
+            )
+    logger.info("obsidian note created (workflow_id=%s path=%s)", workflow_id, file_path)
+
+
+def _finalize_workflow_output_and_note(
+    conn: psycopg.Connection,
     worker_id: str,
     workflow_id: str,
     logger: logging.Logger,
 ) -> None:
-    cur.execute("SELECT to_regclass('public.workflow_outputs')")
-    if cur.fetchone()[0] is None:
-        logger.warning("workflow_outputs table missing; skipping output aggregation")
-        return
-
-    cur.execute(
-        """
-        SELECT workflow_output_id
-        FROM workflow_outputs
-        WHERE workflow_id = %s
-        LIMIT 1
-        """,
-        (workflow_id,),
-    )
-    if cur.fetchone():
-        return
-
-    cur.execute(
-        """
-        SELECT type, completed_at
-        FROM workflows
-        WHERE workflow_id = %s
-        """,
-        (workflow_id,),
-    )
-    workflow_row = cur.fetchone()
-    if not workflow_row:
-        return
-    workflow_type, completed_at = workflow_row
-
-    cur.execute(
-        """
-        SELECT step_id, step_key
-        FROM workflow_steps
-        WHERE workflow_id = %s
-        ORDER BY step_index ASC
-        """,
-        (workflow_id,),
-    )
-    steps = []
-    task_count = 0
-    for step_id, step_key in cur.fetchall():
-        cur.execute(
-            """
-            SELECT task_type, output_json
-            FROM tasks
-            WHERE step_id = %s
-            ORDER BY created_at ASC
-            """,
-            (step_id,),
-        )
-        task_rows = cur.fetchall()
-        task_count += len(task_rows)
-        tasks = [{"task_type": task_type, "output_json": output_json} for task_type, output_json in task_rows]
-        steps.append({"step_key": step_key, "tasks": tasks})
-
-    output = {
-        "workflow_id": workflow_id,
-        "workflow_type": workflow_type,
-        "completed_at": completed_at.isoformat() if completed_at else None,
-        "steps": steps,
-        "summary": {"step_count": len(steps), "task_count": task_count},
-    }
-
-    cur.execute(
-        """
-        INSERT INTO workflow_outputs (
-            workflow_id,
-            output_json,
-            created_at,
-            updated_at
-        ) VALUES (%s, %s, now(), now())
-        RETURNING workflow_output_id
-        """,
-        (workflow_id, Json(output)),
-    )
-    workflow_output_id = cur.fetchone()[0]
-    _audit(
-        cur,
-        worker_id,
-        "workflow_output_created",
-        "workflow_output",
-        str(workflow_output_id),
-        workflow_id,
-        None,
-        None,
-    )
+    workflow_output_id = _create_workflow_output(conn, worker_id, workflow_id, logger)
+    if workflow_output_id:
+        _write_obsidian_note(conn, worker_id, workflow_id, workflow_output_id, logger)
 
 
 def _consume_web_fetch_results(
