@@ -10,6 +10,7 @@ from .signals import NullSignalSource, SignalSource, SignalWriter, SyntheticSign
 from .intents import IntentWriter, RuleBasedIntentClassifier
 from .suggestions import RuleBasedSuggestionGenerator, SuggestionWriter
 from .approvals import Approval, ApprovalWriter
+from .workflows import WorkflowFactory
 
 import psycopg
 
@@ -210,7 +211,7 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                         with conn.cursor() as cur:
                             cur.execute(
                                 """
-                                SELECT suggestion_id, user_id, intent_id, status
+                                SELECT suggestion_id, user_id, intent_id, status, type
                                 FROM suggestions
                                 WHERE suggestion_id = %s
                                 """,
@@ -230,17 +231,38 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                                     f"suggestion status is '{current_status}', expected 'queued'".encode("utf-8")
                                 )
                                 return
+                            suggestion_type = row[4]
+                            workflow_id = None
+                            if decision == "approved":
+                                factory = WorkflowFactory(actor_id="orchestrator")
+                                try:
+                                    workflow_id = factory.create_pending(
+                                        cur, user_id=str(row[1]), suggestion_type=str(suggestion_type)
+                                    )
+                                except ValueError as exc:
+                                    self.send_response(400)
+                                    self.end_headers()
+                                    self.wfile.write(str(exc).encode("utf-8"))
+                                    return
                             approval = Approval(
                                 user_id=str(row[1]),
                                 suggestion_id=str(row[0]),
                                 intent_id=str(row[2]) if row[2] else None,
-                                workflow_id=None,
+                                workflow_id=workflow_id,
                                 decision=decision,
                                 channel="http",
                                 reason=reason,
                             )
                             approval_writer = ApprovalWriter(dsn, actor_id="orchestrator")
                             approval_id = approval_writer.write(approval, cur=cur)
+                            if workflow_id is not None:
+                                factory.audit_workflow_created(
+                                    cur,
+                                    workflow_id=workflow_id,
+                                    approval_id=approval_id,
+                                    suggestion_id=str(row[0]),
+                                    suggestion_type=str(suggestion_type),
+                                )
                             cur.execute(
                                 """
                                 UPDATE suggestions
@@ -251,17 +273,23 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                             )
 
                 logger = logging.getLogger("orchestrator")
+                workflows_created = 1 if workflow_id is not None else 0
                 logger.info(
-                    "approval recorded: approvals=1 suggestions_updated=1 suggestion_id=%s decision=%s approval_id=%s",
+                    "approval recorded: approvals=1 suggestions_updated=1 workflows_created=%s suggestion_id=%s decision=%s approval_id=%s",
+                    workflows_created,
                     suggestion_id,
                     decision,
                     approval_id,
                 )
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(
-                    f"approval_id={approval_id} suggestion_status={new_status}".encode("utf-8")
-                )
+                response_parts = [
+                    f"approval_id={approval_id}",
+                    f"suggestion_status={new_status}",
+                ]
+                if workflow_id is not None:
+                    response_parts.append(f"workflow_id={workflow_id}")
+                self.wfile.write(" ".join(response_parts).encode("utf-8"))
                 return
 
             self.send_response(404)
