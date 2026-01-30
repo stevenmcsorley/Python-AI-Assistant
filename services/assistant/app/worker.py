@@ -17,7 +17,7 @@ import requests
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from .messages import Message, MessageWriter
+from .messages import Message, MessageWriter, deliver_queued_message
 
 REQUIRED_TABLES = ("tasks", "task_attempts", "audit_log")
 LEASE_DURATION_SECONDS = 120
@@ -1257,6 +1257,7 @@ def main() -> None:
     listen_host = os.getenv("WORKER_HOST", "0.0.0.0")
     listen_port = _env_int("WORKER_PORT", 8001)
     readiness_interval = _env_int("READINESS_CHECK_SECONDS", 10)
+    delivery_interval = _env_int("MESSAGE_DELIVERY_INTERVAL_SECONDS", 5)
 
     stop_event = threading.Event()
     readiness = _ReadinessState()
@@ -1312,6 +1313,7 @@ def main() -> None:
 
     poll_interval = _env_int("WORKER_POLL_SECONDS", 5)
     last_ready_check = 0.0
+    last_delivery_check = 0.0
 
     while not stop_event.is_set():
         now = time.monotonic()
@@ -1323,6 +1325,14 @@ def main() -> None:
                 logger.info("readiness state: %s (%s)", state, message)
                 last_ready = ready
             last_ready_check = now
+
+        if readiness.get()[0] and now - last_delivery_check >= delivery_interval:
+            if conn is not None:
+                try:
+                    deliver_queued_message(conn, worker_id)
+                except Exception as exc:
+                    logger.error("message delivery failed: %s", exc)
+            last_delivery_check = now
 
         if readiness.get()[0]:
             try:
