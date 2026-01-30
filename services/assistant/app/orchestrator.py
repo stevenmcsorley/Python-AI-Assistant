@@ -11,6 +11,7 @@ from .intents import IntentWriter, RuleBasedIntentClassifier
 from .suggestions import RuleBasedSuggestionGenerator, SuggestionWriter
 from .approvals import Approval, ApprovalWriter
 from .messages import Message, MessageWriter
+from .messages.inbound import handle_inbound_text
 from .workflows import WorkflowFactory, WorkflowStepPlanner, plan_pending_workflows
 from .tasks import TaskPlanner, plan_pending_tasks
 
@@ -352,6 +353,42 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                 if workflow_id is not None:
                     response_parts.append(f"workflow_id={workflow_id}")
                 self.wfile.write(" ".join(response_parts).encode("utf-8"))
+                return
+            if self.path == "/whatsapp":
+                ready, msg = state.get()
+                if not ready:
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(msg.encode("utf-8"))
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = 0
+                raw_body = self.rfile.read(length) if length > 0 else b""
+                try:
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"invalid json")
+                    return
+                user_id = payload.get("user_id")
+                text = payload.get("text")
+                if not isinstance(user_id, str) or not user_id:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"user_id is required")
+                    return
+                if not isinstance(text, str) or not text:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"text is required")
+                    return
+                status_code, response_text = handle_inbound_text(dsn, user_id, text)
+                self.send_response(status_code)
+                self.end_headers()
+                self.wfile.write(response_text.encode("utf-8"))
                 return
 
             self.send_response(404)
