@@ -11,6 +11,7 @@ from .intents import IntentWriter, RuleBasedIntentClassifier
 from .suggestions import RuleBasedSuggestionGenerator, SuggestionWriter
 from .approvals import Approval, ApprovalWriter
 from .workflows import WorkflowFactory, WorkflowStepPlanner, plan_pending_workflows
+from .tasks import TaskPlanner, plan_pending_tasks
 
 import psycopg
 
@@ -257,6 +258,29 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                                     self.end_headers()
                                     self.wfile.write(str(exc).encode("utf-8"))
                                     return
+                                task_planner = TaskPlanner(actor_id="orchestrator")
+                                cur.execute(
+                                    """
+                                    SELECT step_id, step_key, status
+                                    FROM workflow_steps
+                                    WHERE workflow_id = %s
+                                    """,
+                                    (workflow_id,),
+                                )
+                                for step_id, step_key, step_status in cur.fetchall():
+                                    try:
+                                        task_planner.ensure_tasks(
+                                            cur,
+                                            step_id=str(step_id),
+                                            workflow_id=workflow_id,
+                                            step_key=str(step_key),
+                                            step_status=str(step_status),
+                                        )
+                                    except ValueError as exc:
+                                        self.send_response(400)
+                                        self.end_headers()
+                                        self.wfile.write(str(exc).encode("utf-8"))
+                                        return
                             approval = Approval(
                                 user_id=str(row[1]),
                                 suggestion_id=str(row[0]),
@@ -357,6 +381,13 @@ def main() -> None:
                 "workflow step planning: workflows_planned=%s steps_created=%s",
                 planned,
                 steps_created,
+            )
+        task_planned, tasks_created = plan_pending_tasks(dsn, actor_id="orchestrator")
+        if task_planned:
+            logger.info(
+                "task materialization: steps_planned=%s tasks_created=%s",
+                task_planned,
+                tasks_created,
             )
 
     while not stop_event.wait(readiness_interval):
