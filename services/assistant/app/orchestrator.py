@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import signal
@@ -8,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .signals import NullSignalSource, SignalSource, SignalWriter, SyntheticSignalSource
 from .intents import IntentWriter, RuleBasedIntentClassifier
 from .suggestions import RuleBasedSuggestionGenerator, SuggestionWriter
+from .approvals import Approval, ApprovalWriter
 
 import psycopg
 
@@ -111,53 +113,160 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
 
         def do_POST(self) -> None:  # noqa: N802 - stdlib signature
-            if self.path != "/ingest":
-                self.send_response(404)
+            if self.path == "/ingest":
+                ready, msg = state.get()
+                if not ready:
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(msg.encode("utf-8"))
+                    return
+                ingested, total, new_signals = ingest_signals()
+                intents_created = 0
+                intents_processed = 0
+                suggestions_created = 0
+                if new_signals:
+                    classifier = RuleBasedIntentClassifier()
+                    intent_writer = IntentWriter(dsn, actor_id="orchestrator")
+                    suggestion_generator = RuleBasedSuggestionGenerator()
+                    suggestion_writer = SuggestionWriter(dsn, actor_id="orchestrator")
+                    for signal, signal_id in new_signals:
+                        intents = classifier.classify(signal, signal_id=signal_id)
+                        intents_processed += len(intents)
+                        for intent in intents:
+                            intent_id, created = intent_writer.write(intent)
+                            if created:
+                                intents_created += 1
+                            suggestion = suggestion_generator.generate(intent, intent_id, signal)
+                            if suggestion is not None:
+                                _, suggestion_created = suggestion_writer.write(suggestion)
+                                if suggestion_created:
+                                    suggestions_created += 1
+                self.send_response(200)
                 self.end_headers()
-                return
-            ready, msg = state.get()
-            if not ready:
-                self.send_response(503)
-                self.end_headers()
-                self.wfile.write(msg.encode("utf-8"))
-                return
-            ingested, total, new_signals = ingest_signals()
-            intents_created = 0
-            intents_processed = 0
-            suggestions_created = 0
-            if new_signals:
-                classifier = RuleBasedIntentClassifier()
-                intent_writer = IntentWriter(dsn, actor_id="orchestrator")
-                suggestion_generator = RuleBasedSuggestionGenerator()
-                suggestion_writer = SuggestionWriter(dsn, actor_id="orchestrator")
-                for signal, signal_id in new_signals:
-                    intents = classifier.classify(signal, signal_id=signal_id)
-                    intents_processed += len(intents)
-                    for intent in intents:
-                        intent_id, created = intent_writer.write(intent)
-                        if created:
-                            intents_created += 1
-                        suggestion = suggestion_generator.generate(intent, intent_id, signal)
-                        if suggestion is not None:
-                            _, suggestion_created = suggestion_writer.write(suggestion)
-                            if suggestion_created:
-                                suggestions_created += 1
-            self.send_response(200)
-            self.end_headers()
-            logger = logging.getLogger("orchestrator")
-            logger.info(
-                "ingest complete: signals_total=%s signals_ingested=%s intents_processed=%s intents_created=%s suggestions_created=%s",
-                total,
-                ingested,
-                intents_processed,
-                intents_created,
-                suggestions_created,
-            )
-            self.wfile.write(
-                f"ingested={ingested} total={total} intents_created={intents_created} suggestions_created={suggestions_created}".encode(
-                    "utf-8"
+                logger = logging.getLogger("orchestrator")
+                logger.info(
+                    "ingest complete: signals_total=%s signals_ingested=%s intents_processed=%s intents_created=%s suggestions_created=%s",
+                    total,
+                    ingested,
+                    intents_processed,
+                    intents_created,
+                    suggestions_created,
                 )
-            )
+                self.wfile.write(
+                    f"ingested={ingested} total={total} intents_created={intents_created} suggestions_created={suggestions_created}".encode(
+                        "utf-8"
+                    )
+                )
+                return
+
+            if self.path == "/approve":
+                ready, msg = state.get()
+                if not ready:
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(msg.encode("utf-8"))
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = 0
+                raw_body = self.rfile.read(length) if length > 0 else b""
+                try:
+                    payload = json.loads(raw_body.decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"invalid json")
+                    return
+                suggestion_id = payload.get("suggestion_id")
+                decision = payload.get("decision")
+                reason = payload.get("reason")
+                if not suggestion_id:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"suggestion_id is required")
+                    return
+                if not isinstance(decision, str):
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"decision is required")
+                    return
+                decision = decision.lower().strip()
+                if decision not in ("approved", "denied"):
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"decision must be 'approved' or 'denied'")
+                    return
+                if reason is not None and not isinstance(reason, str):
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"reason must be a string")
+                    return
+
+                approval_id = None
+                new_status = "accepted" if decision == "approved" else "dismissed"
+                with psycopg.connect(dsn) as conn:
+                    with conn.transaction():
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                SELECT suggestion_id, user_id, intent_id, status
+                                FROM suggestions
+                                WHERE suggestion_id = %s
+                                """,
+                                (suggestion_id,),
+                            )
+                            row = cur.fetchone()
+                            if not row:
+                                self.send_response(404)
+                                self.end_headers()
+                                self.wfile.write(b"suggestion not found")
+                                return
+                            current_status = row[3]
+                            if current_status != "queued":
+                                self.send_response(409)
+                                self.end_headers()
+                                self.wfile.write(
+                                    f"suggestion status is '{current_status}', expected 'queued'".encode("utf-8")
+                                )
+                                return
+                            approval = Approval(
+                                user_id=str(row[1]),
+                                suggestion_id=str(row[0]),
+                                intent_id=str(row[2]) if row[2] else None,
+                                workflow_id=None,
+                                decision=decision,
+                                channel="http",
+                                reason=reason,
+                            )
+                            approval_writer = ApprovalWriter(dsn, actor_id="orchestrator")
+                            approval_id = approval_writer.write(approval, cur=cur)
+                            cur.execute(
+                                """
+                                UPDATE suggestions
+                                SET status = %s, updated_at = now()
+                                WHERE suggestion_id = %s
+                                """,
+                                (new_status, suggestion_id),
+                            )
+
+                logger = logging.getLogger("orchestrator")
+                logger.info(
+                    "approval recorded: approvals=1 suggestions_updated=1 suggestion_id=%s decision=%s approval_id=%s",
+                    suggestion_id,
+                    decision,
+                    approval_id,
+                )
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(
+                    f"approval_id={approval_id} suggestion_status={new_status}".encode("utf-8")
+                )
+                return
+
+            self.send_response(404)
+            self.end_headers()
+            return
 
         def log_message(self, format: str, *args: object) -> None:
             return
