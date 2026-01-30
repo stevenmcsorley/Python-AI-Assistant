@@ -595,69 +595,6 @@ def _complete_task_and_advance(
                 return
 
             if task["step_id"] is None:
-                cur.execute(
-                    """
-                    SELECT COUNT(*) FROM workflow_steps
-                    WHERE workflow_id = %s
-                    """,
-                    (task["workflow_id"],),
-                )
-                step_count = cur.fetchone()[0]
-                if step_count != 0:
-                    return
-
-                cur.execute(
-                    """
-                    INSERT INTO workflow_checkpoints (
-                        workflow_id,
-                        step_name,
-                        state_json,
-                        created_by
-                    ) VALUES (%s, %s, %s, %s)
-                    RETURNING checkpoint_id
-                    """,
-                    (
-                        task["workflow_id"],
-                        "implicit_task_completion",
-                        Json({"completed_task_id": str(task["task_id"])}),
-                        worker_id,
-                    ),
-                )
-                checkpoint_id = cur.fetchone()[0]
-                _audit(
-                    cur,
-                    worker_id,
-                    "workflow_checkpointed",
-                    "workflow",
-                    str(task["workflow_id"]),
-                    str(task["workflow_id"]),
-                    None,
-                    str(task["task_id"]),
-                )
-                logger.info("workflow checkpoint written (workflow_id=%s)", task["workflow_id"])
-
-                cur.execute(
-                    """
-                    UPDATE workflows
-                    SET status = 'completed',
-                        completed_at = now(),
-                        checkpoint_id = %s,
-                        updated_at = now()
-                    WHERE workflow_id = %s
-                    """,
-                    (checkpoint_id, task["workflow_id"]),
-                )
-                _audit(
-                    cur,
-                    worker_id,
-                    "workflow_completed",
-                    "workflow",
-                    str(task["workflow_id"]),
-                    str(task["workflow_id"]),
-                    None,
-                    str(task["task_id"]),
-                )
-                logger.info("workflow marked completed (workflow_id=%s)", task["workflow_id"])
                 return
 
             cur.execute(
@@ -678,14 +615,15 @@ def _complete_task_and_advance(
                     completed_at = now(),
                     updated_at = now()
                 WHERE step_id = %s
-                RETURNING step_index, step_key
+                  AND status != 'completed'
+                RETURNING step_key
                 """,
                 (task["step_id"],),
             )
             row = cur.fetchone()
             if not row:
                 return
-            step_index, step_key = row
+            step_key = row[0]
             _audit(
                 cur,
                 worker_id,
@@ -695,90 +633,9 @@ def _complete_task_and_advance(
                 str(task["workflow_id"]),
                 str(task["step_id"]),
                 str(task["task_id"]),
+                {"workflow_id": str(task["workflow_id"]), "step_key": str(step_key)},
             )
             logger.info("workflow step completed (step_id=%s)", task["step_id"])
-
-            cur.execute(
-                """
-                SELECT step_id FROM workflow_steps
-                WHERE workflow_id = %s AND step_index > %s
-                ORDER BY step_index ASC
-                LIMIT 1
-                """,
-                (task["workflow_id"], step_index),
-            )
-            next_step = cur.fetchone()
-
-            cur.execute(
-                """
-                INSERT INTO workflow_checkpoints (
-                    workflow_id,
-                    step_name,
-                    state_json,
-                    created_by
-                ) VALUES (%s, %s, %s, %s)
-                RETURNING checkpoint_id
-                """,
-                (task["workflow_id"], step_key, Json({"completed_step_id": str(task["step_id"])}), worker_id),
-            )
-            checkpoint_id = cur.fetchone()[0]
-            _audit(
-                cur,
-                worker_id,
-                "workflow_checkpointed",
-                "workflow",
-                str(task["workflow_id"]),
-                str(task["workflow_id"]),
-                str(task["step_id"]),
-                str(task["task_id"]),
-            )
-            logger.info("workflow checkpoint written (workflow_id=%s)", task["workflow_id"])
-
-            if next_step is None:
-                cur.execute(
-                    """
-                    UPDATE workflows
-                    SET status = 'completed',
-                        completed_at = now(),
-                        checkpoint_id = %s,
-                        updated_at = now()
-                    WHERE workflow_id = %s
-                    """,
-                    (checkpoint_id, task["workflow_id"]),
-                )
-                _audit(
-                    cur,
-                    worker_id,
-                    "workflow_completed",
-                    "workflow",
-                    str(task["workflow_id"]),
-                    str(task["workflow_id"]),
-                    str(task["step_id"]),
-                    str(task["task_id"]),
-                )
-                logger.info("workflow marked completed (workflow_id=%s)", task["workflow_id"])
-            else:
-                cur.execute(
-                    """
-                    UPDATE workflows
-                    SET current_step_id = %s,
-                        checkpoint_id = %s,
-                        updated_at = now()
-                    WHERE workflow_id = %s
-                    """,
-                    (next_step[0], checkpoint_id, task["workflow_id"]),
-                )
-                _audit(
-                    cur,
-                    worker_id,
-                    "workflow_advanced",
-                    "workflow",
-                    str(task["workflow_id"]),
-                    str(task["workflow_id"]),
-                    str(task["step_id"]),
-                    str(task["task_id"]),
-                    {"next_step_id": str(next_step[0])},
-                )
 
 
 def _execute_noop(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
