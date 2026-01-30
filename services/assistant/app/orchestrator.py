@@ -5,6 +5,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .signals import NullSignalSource, SignalSource, SignalWriter
+
 import psycopg
 
 
@@ -60,6 +62,22 @@ class _ReadinessState:
 
 
 def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
+    signal_sources: list[SignalSource] = [NullSignalSource()]
+    dsn = os.getenv("DATABASE_URL", "")
+
+    def ingest_signals() -> tuple[int, int]:
+        writer = SignalWriter(dsn, actor_id="orchestrator")
+        ingested = 0
+        total = 0
+        for source in signal_sources:
+            signals = source.fetch()
+            total += len(signals)
+            for signal in signals:
+                _, created = writer.write(signal)
+                if created:
+                    ingested += 1
+        return ingested, total
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib signature
             if self.path in ("/healthz", "/health"):
@@ -80,6 +98,22 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                 return
             self.send_response(404)
             self.end_headers()
+
+        def do_POST(self) -> None:  # noqa: N802 - stdlib signature
+            if self.path != "/ingest":
+                self.send_response(404)
+                self.end_headers()
+                return
+            ready, msg = state.get()
+            if not ready:
+                self.send_response(503)
+                self.end_headers()
+                self.wfile.write(msg.encode("utf-8"))
+                return
+            ingested, total = ingest_signals()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(f\"ingested={ingested} total={total}\".encode(\"utf-8\"))
 
         def log_message(self, format: str, *args: object) -> None:
             return
