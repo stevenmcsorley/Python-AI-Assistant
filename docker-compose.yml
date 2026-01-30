@@ -60,6 +60,12 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./obsidian-vault:/obsidian
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; url='http://127.0.0.1:8001/ready';\ntry:\n  urllib.request.urlopen(url, timeout=2).read();\n  sys.exit(0)\nexcept Exception:\n  sys.exit(1)\n"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   postgres:
