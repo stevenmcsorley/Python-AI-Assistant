@@ -186,7 +186,9 @@ def _handle_status(
         related_entity_type="workflow",
         related_entity_id=workflow_id,
     )
-    _, created = message_writer.write(message, cur=cur)
+    message_id, created = message_writer.write(message, cur=cur)
+    if message_id:
+        message_writer.render_message(message_id, cur=cur)
     if not created:
         _audit_command(
             cur,

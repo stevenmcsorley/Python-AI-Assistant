@@ -155,7 +155,12 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                                         related_entity_type="suggestion",
                                         related_entity_id=str(suggestion_id),
                                     )
-                                    message_writer.write(message)
+                                    with psycopg.connect(dsn) as msg_conn:
+                                        with msg_conn.transaction():
+                                            with msg_conn.cursor() as msg_cur:
+                                                message_id, _ = message_writer.write(message, cur=msg_cur)
+                                                if message_id:
+                                                    message_writer.render_message(message_id, cur=msg_cur)
                 self.send_response(200)
                 self.end_headers()
                 logger = logging.getLogger("orchestrator")
@@ -325,7 +330,9 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                                     related_entity_type="workflow",
                                     related_entity_id=workflow_id,
                                 )
-                                message_writer.write(message, cur=cur)
+                                message_id, _ = message_writer.write(message, cur=cur)
+                                if message_id:
+                                    message_writer.render_message(message_id, cur=cur)
                             cur.execute(
                                 """
                                 UPDATE suggestions
