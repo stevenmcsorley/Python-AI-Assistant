@@ -216,10 +216,11 @@ def _claim_task(conn: psycopg.Connection, worker_id: str, logger: logging.Logger
                 WITH candidate AS (
                     SELECT task_id
                     FROM tasks
-                    WHERE (
+                    WHERE task_type = 'noop'
+                      AND (
                         status IN ('pending','scheduled')
                         OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < now())
-                    )
+                      )
                     ORDER BY updated_at NULLS LAST, created_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -238,6 +239,26 @@ def _claim_task(conn: psycopg.Connection, worker_id: str, logger: logging.Logger
             )
             task = cur.fetchone()
             if not task:
+                cur.execute(
+                    """
+                    SELECT task_id, task_type
+                    FROM tasks
+                    WHERE task_type != 'noop'
+                      AND (
+                        status IN ('pending','scheduled')
+                        OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < now())
+                      )
+                    ORDER BY updated_at NULLS LAST, created_at ASC
+                    LIMIT 1
+                    """
+                )
+                non_noop = cur.fetchone()
+                if non_noop:
+                    logger.warning(
+                        "non-noop task present; skipping (task_id=%s task_type=%s)",
+                        non_noop["task_id"],
+                        non_noop["task_type"],
+                    )
                 return None
 
             ts_claim = datetime.now(timezone.utc)
@@ -647,7 +668,11 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
         return
 
     if task["task_type"] != "noop":
-        _mark_failed(conn, worker_id, task, "unsupported_task_type")
+        logger.warning(
+            "skipping non-noop task (task_id=%s task_type=%s)",
+            task["task_id"],
+            task["task_type"],
+        )
         return
 
     _execute_noop(conn, worker_id, task)
