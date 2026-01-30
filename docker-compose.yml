@@ -19,6 +19,8 @@ services:
       WHATSAPP_WEBHOOK_SECRET: ${WHATSAPP_WEBHOOK_SECRET:-}
       QUIET_HOURS: ${QUIET_HOURS:-"22:00-07:00"}
       BACKGROUND_POLL_INTERVAL: ${BACKGROUND_POLL_INTERVAL:-3600}
+      INGEST_SYNTHETIC_SIGNALS: ${INGEST_SYNTHETIC_SIGNALS:-false}
+      DEFAULT_USER_ID: ${DEFAULT_USER_ID:-}
     depends_on:
       postgres:
         condition: service_started
