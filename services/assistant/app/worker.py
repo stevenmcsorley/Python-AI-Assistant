@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 import signal
@@ -8,6 +9,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from dataclasses import dataclass
 
 import psycopg
 from psycopg.rows import dict_row
@@ -18,18 +20,102 @@ REQUIRED_TABLES = ("tasks", "task_attempts", "audit_log")
 LEASE_DURATION_SECONDS = 120
 LEASE_RENEW_SECONDS = 30
 
-STUB_TASK_TYPES = {
-    "fetch_sources",
-    "read_sources",
-    "synthesize",
-    "write_note",
-    "gather_context",
-    "research_context",
-    "write_brief",
-    "gather_goals",
-    "review_calendar",
-    "write_plan",
+
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    description: str
+    allowed_task_types: tuple[str, ...]
+    input_schema: dict
+
+
+_DEFAULT_TOOL_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "string"},
+        "task_type": {"type": "string"},
+    },
+    "required": ["task_id", "task_type"],
+    "additionalProperties": False,
 }
+
+TOOL_REGISTRY: dict[str, Tool] = {
+    "web_fetch": Tool(
+        name="web_fetch",
+        description="Fetch sources from the web (planned only).",
+        allowed_task_types=("fetch_sources",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+    "content_reader": Tool(
+        name="content_reader",
+        description="Read and parse content (planned only).",
+        allowed_task_types=("read_sources",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+    "summarizer": Tool(
+        name="summarizer",
+        description="Summarize content (planned only).",
+        allowed_task_types=("synthesize",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+    "markdown_writer": Tool(
+        name="markdown_writer",
+        description="Write markdown output (planned only).",
+        allowed_task_types=("write_note",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+    "context_collector": Tool(
+        name="context_collector",
+        description="Collect context (planned only).",
+        allowed_task_types=("gather_context",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+    "web_research": Tool(
+        name="web_research",
+        description="Research context (planned only).",
+        allowed_task_types=("research_context",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+    "brief_writer": Tool(
+        name="brief_writer",
+        description="Draft a brief (planned only).",
+        allowed_task_types=("write_brief",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+    "goal_collector": Tool(
+        name="goal_collector",
+        description="Collect goals (planned only).",
+        allowed_task_types=("gather_goals",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+    "calendar_reader": Tool(
+        name="calendar_reader",
+        description="Review calendar (planned only).",
+        allowed_task_types=("review_calendar",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+    "plan_writer": Tool(
+        name="plan_writer",
+        description="Draft a plan (planned only).",
+        allowed_task_types=("write_plan",),
+        input_schema=_DEFAULT_TOOL_INPUT_SCHEMA,
+    ),
+}
+
+TASK_TOOL_MAPPING: dict[str, str] = {
+    "fetch_sources": "web_fetch",
+    "read_sources": "content_reader",
+    "synthesize": "summarizer",
+    "write_note": "markdown_writer",
+    "gather_context": "context_collector",
+    "research_context": "web_research",
+    "write_brief": "brief_writer",
+    "gather_goals": "goal_collector",
+    "review_calendar": "calendar_reader",
+    "write_plan": "plan_writer",
+}
+
+STUB_TASK_TYPES = set(TASK_TOOL_MAPPING.keys())
 
 
 def _env_int(name: str, default: int) -> int:
@@ -715,6 +801,56 @@ def _execute_stub(task: dict, logger: logging.Logger) -> dict:
     }
 
 
+def _plan_tool_invocation(
+    conn: psycopg.Connection,
+    worker_id: str,
+    task: dict,
+    tool: Tool,
+    logger: logging.Logger,
+) -> None:
+    payload = {
+        "task_id": str(task["task_id"]),
+        "task_type": task["task_type"],
+        "tool_name": tool.name,
+    }
+    input_ref = json.dumps(payload, sort_keys=True)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tool_executions (
+                    task_id,
+                    tool_name,
+                    sandbox_type,
+                    status,
+                    input_ref,
+                    output_ref
+                ) VALUES (
+                    %s, %s, 'none', %s, %s, NULL
+                )
+                RETURNING tool_exec_id
+                """,
+                (task["task_id"], tool.name, "running", input_ref),
+            )
+            tool_exec_id = cur.fetchone()[0]
+            _audit(
+                cur,
+                worker_id,
+                "tool_planned",
+                "task",
+                str(task["task_id"]),
+                str(task["workflow_id"]) if task["workflow_id"] else None,
+                str(task["step_id"]) if task["step_id"] else None,
+                str(task["task_id"]),
+                {"tool_name": tool.name, "tool_exec_id": str(tool_exec_id)},
+            )
+    logger.info(
+        "tool planned (task_id=%s tool_name=%s)",
+        task["task_id"],
+        tool.name,
+    )
+
+
 def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: logging.Logger) -> None:
     if task["attempts"] > task["max_attempts"]:
         _mark_failed(conn, worker_id, task, "max_attempts_exceeded")
@@ -728,6 +864,17 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
         return
 
     if task_type in STUB_TASK_TYPES:
+        tool_name = TASK_TOOL_MAPPING.get(task_type)
+        if tool_name is None:
+            logger.error("no tool mapping for task_type (task_id=%s task_type=%s)", task["task_id"], task_type)
+            _mark_task_failed_only(conn, worker_id, task, "missing_tool_mapping")
+            return
+        tool = TOOL_REGISTRY.get(tool_name)
+        if tool is None:
+            logger.error("tool not registered (task_id=%s tool_name=%s)", task["task_id"], tool_name)
+            _mark_task_failed_only(conn, worker_id, task, "tool_not_registered")
+            return
+        _plan_tool_invocation(conn, worker_id, task, tool, logger)
         output = _execute_stub(task, logger)
         _complete_task_and_advance(conn, worker_id, task, logger, output_json=output)
         logger.info("task completed (task_id=%s)", task["task_id"])
