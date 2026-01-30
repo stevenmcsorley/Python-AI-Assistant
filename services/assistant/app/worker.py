@@ -679,6 +679,12 @@ def _complete_task_and_advance(
                         {"final_step_id": str(task["step_id"]), "step_count": step_count},
                     )
                     logger.info("workflow completed (workflow_id=%s)", task["workflow_id"])
+                    _create_workflow_output(
+                        cur,
+                        worker_id,
+                        str(task["workflow_id"]),
+                        logger,
+                    )
 
 
 def _execute_noop(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
@@ -702,6 +708,101 @@ def _execute_stub(task: dict, logger: logging.Logger) -> dict:
         "task_type": task["task_type"],
         "note": "stub execution only",
     }
+
+
+def _create_workflow_output(
+    cur: psycopg.Cursor,
+    worker_id: str,
+    workflow_id: str,
+    logger: logging.Logger,
+) -> None:
+    cur.execute("SELECT to_regclass('public.workflow_outputs')")
+    if cur.fetchone()[0] is None:
+        logger.warning("workflow_outputs table missing; skipping output aggregation")
+        return
+
+    cur.execute(
+        """
+        SELECT workflow_output_id
+        FROM workflow_outputs
+        WHERE workflow_id = %s
+        LIMIT 1
+        """,
+        (workflow_id,),
+    )
+    if cur.fetchone():
+        return
+
+    cur.execute(
+        """
+        SELECT type, completed_at
+        FROM workflows
+        WHERE workflow_id = %s
+        """,
+        (workflow_id,),
+    )
+    workflow_row = cur.fetchone()
+    if not workflow_row:
+        return
+    workflow_type, completed_at = workflow_row
+
+    cur.execute(
+        """
+        SELECT step_id, step_key
+        FROM workflow_steps
+        WHERE workflow_id = %s
+        ORDER BY step_index ASC
+        """,
+        (workflow_id,),
+    )
+    steps = []
+    task_count = 0
+    for step_id, step_key in cur.fetchall():
+        cur.execute(
+            """
+            SELECT task_type, output_json
+            FROM tasks
+            WHERE step_id = %s
+            ORDER BY created_at ASC
+            """,
+            (step_id,),
+        )
+        task_rows = cur.fetchall()
+        task_count += len(task_rows)
+        tasks = [{"task_type": task_type, "output_json": output_json} for task_type, output_json in task_rows]
+        steps.append({"step_key": step_key, "tasks": tasks})
+
+    output = {
+        "workflow_id": workflow_id,
+        "workflow_type": workflow_type,
+        "completed_at": completed_at.isoformat() if completed_at else None,
+        "steps": steps,
+        "summary": {"step_count": len(steps), "task_count": task_count},
+    }
+
+    cur.execute(
+        """
+        INSERT INTO workflow_outputs (
+            workflow_id,
+            output_json,
+            created_at,
+            updated_at
+        ) VALUES (%s, %s, now(), now())
+        RETURNING workflow_output_id
+        """,
+        (workflow_id, Json(output)),
+    )
+    workflow_output_id = cur.fetchone()[0]
+    _audit(
+        cur,
+        worker_id,
+        "workflow_output_created",
+        "workflow_output",
+        str(workflow_output_id),
+        workflow_id,
+        None,
+        None,
+    )
 
 
 def _consume_web_fetch_results(
