@@ -804,6 +804,82 @@ def _execute_stub(task: dict, logger: logging.Logger) -> dict:
     }
 
 
+def _consume_web_fetch_results(
+    conn: psycopg.Connection,
+    worker_id: str,
+    task: dict,
+) -> dict:
+    workflow_id = task.get("workflow_id")
+    summary = {"sources_found": 0, "content_types": [], "total_bytes": 0}
+    if workflow_id is None:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _audit(
+                    cur,
+                    worker_id,
+                    "tool_results_consumed",
+                    "task",
+                    str(task["task_id"]),
+                    None,
+                    str(task["step_id"]) if task.get("step_id") else None,
+                    str(task["task_id"]),
+                    summary,
+                )
+        return summary
+
+    content_types = set()
+    total_bytes = 0
+    sources_found = 0
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT te.output_ref
+                FROM tool_executions te
+                JOIN tasks t ON te.task_id = t.task_id
+                WHERE t.workflow_id = %s
+                  AND te.tool_name = 'web_fetch'
+                  AND te.status = 'completed'
+                ORDER BY te.started_at ASC
+                """,
+                (workflow_id,),
+            )
+            rows = cur.fetchall()
+            for (output_ref,) in rows:
+                if not output_ref:
+                    continue
+                try:
+                    payload = json.loads(output_ref)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                sources_found += 1
+                content_type = payload.get("content_type")
+                if isinstance(content_type, str) and content_type:
+                    content_types.add(content_type)
+                content_length = payload.get("content_length")
+                if isinstance(content_length, int) and content_length >= 0:
+                    total_bytes += content_length
+
+            summary = {
+                "sources_found": sources_found,
+                "content_types": sorted(content_types),
+                "total_bytes": total_bytes,
+            }
+            _audit(
+                cur,
+                worker_id,
+                "tool_results_consumed",
+                "task",
+                str(task["task_id"]),
+                str(task["workflow_id"]),
+                str(task["step_id"]) if task.get("step_id") else None,
+                str(task["task_id"]),
+                summary,
+            )
+    return summary
+
+
 def _plan_tool_invocation(
     conn: psycopg.Connection,
     worker_id: str,
@@ -1017,6 +1093,9 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
         if tool.name == "web_fetch" and sandbox_type == "local":
             _execute_web_fetch(conn, worker_id, task, tool_exec_id, input_payload, logger)
         output = _execute_stub(task, logger)
+        if task_type == "read_sources":
+            summary = _consume_web_fetch_results(conn, worker_id, task)
+            output["summary"] = summary
         _complete_task_and_advance(conn, worker_id, task, logger, output_json=output)
         logger.info("task completed (task_id=%s)", task["task_id"])
         return
