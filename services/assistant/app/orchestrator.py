@@ -6,6 +6,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .signals import NullSignalSource, SignalSource, SignalWriter, SyntheticSignalSource
+from .intents import IntentWriter, RuleBasedIntentClassifier
 
 import psycopg
 
@@ -72,18 +73,20 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
     else:
         signal_sources = [NullSignalSource()]
 
-    def ingest_signals() -> tuple[int, int]:
+    def ingest_signals() -> tuple[int, int, list[tuple[object, str]]]:
         writer = SignalWriter(dsn, actor_id="orchestrator")
         ingested = 0
         total = 0
+        new_signals: list[tuple[object, str]] = []
         for source in signal_sources:
             signals = source.fetch()
             total += len(signals)
             for signal in signals:
-                _, created = writer.write(signal)
+                signal_id, created = writer.write(signal)
                 if created:
                     ingested += 1
-        return ingested, total
+                    new_signals.append((signal, signal_id))
+        return ingested, total, new_signals
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib signature
@@ -117,10 +120,32 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                 self.end_headers()
                 self.wfile.write(msg.encode("utf-8"))
                 return
-            ingested, total = ingest_signals()
+            ingested, total, new_signals = ingest_signals()
+            intents_created = 0
+            signals_processed = 0
+            if new_signals:
+                classifier = RuleBasedIntentClassifier()
+                intent_writer = IntentWriter(dsn, actor_id="orchestrator")
+                for signal, signal_id in new_signals:
+                    signals_processed += 1
+                    intents = classifier.classify(signal, signal_id=signal_id)
+                    for intent in intents:
+                        _, created = intent_writer.write(intent)
+                        if created:
+                            intents_created += 1
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(f\"ingested={ingested} total={total}\".encode(\"utf-8\"))
+            logger = logging.getLogger("orchestrator")
+            logger.info(
+                "ingest complete: signals_total=%s signals_ingested=%s signals_processed=%s intents_created=%s",
+                total,
+                ingested,
+                signals_processed,
+                intents_created,
+            )
+            self.wfile.write(
+                f\"ingested={ingested} total={total} intents_created={intents_created}\".encode(\"utf-8\")
+            )
 
         def log_message(self, format: str, *args: object) -> None:
             return
