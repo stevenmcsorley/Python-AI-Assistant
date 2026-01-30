@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psycopg
@@ -158,13 +159,16 @@ def _audit(
     step_id: str | None,
     task_id: str | None,
     metadata: dict | None = None,
+    timestamp: datetime | None = None,
 ) -> None:
+    ts = timestamp or datetime.now(timezone.utc)
     digest = hashlib.sha256(
         f"{actor_id}:{action_type}:{entity_type}:{entity_id}:{time.time_ns()}".encode("utf-8")
     ).hexdigest()
     cur.execute(
         """
         INSERT INTO audit_log (
+            timestamp,
             actor_type,
             actor_id,
             action_type,
@@ -176,6 +180,7 @@ def _audit(
             audit_hash,
             metadata
         ) VALUES (
+            %s,
             'worker',
             %s,
             %s,
@@ -189,6 +194,7 @@ def _audit(
         )
         """,
         (
+            ts,
             actor_id,
             action_type,
             entity_type,
@@ -202,7 +208,7 @@ def _audit(
     )
 
 
-def _claim_task(conn: psycopg.Connection, worker_id: str) -> dict | None:
+def _claim_task(conn: psycopg.Connection, worker_id: str, logger: logging.Logger) -> dict | None:
     with conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -234,6 +240,9 @@ def _claim_task(conn: psycopg.Connection, worker_id: str) -> dict | None:
             if not task:
                 return None
 
+            ts_claim = datetime.now(timezone.utc)
+            ts_start = ts_claim + timedelta(microseconds=1)
+
             attempt_number = task["attempts"]
             cur.execute(
                 """
@@ -256,6 +265,7 @@ def _claim_task(conn: psycopg.Connection, worker_id: str) -> dict | None:
                 str(task["workflow_id"]) if task["workflow_id"] else None,
                 str(task["step_id"]) if task["step_id"] else None,
                 str(task["task_id"]),
+                timestamp=ts_claim,
             )
             _audit(
                 cur,
@@ -266,7 +276,10 @@ def _claim_task(conn: psycopg.Connection, worker_id: str) -> dict | None:
                 str(task["workflow_id"]) if task["workflow_id"] else None,
                 str(task["step_id"]) if task["step_id"] else None,
                 str(task["task_id"]),
+                timestamp=ts_start,
             )
+            logger.info("task claimed (task_id=%s)", task["task_id"])
+            logger.info("task started (task_id=%s)", task["task_id"])
             return task
 
 
@@ -387,7 +400,7 @@ def _mark_failed(
                 )
 
 
-def _complete_task_and_advance(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
+def _complete_task_and_advance(conn: psycopg.Connection, worker_id: str, task: dict, logger: logging.Logger) -> None:
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
@@ -424,7 +437,73 @@ def _complete_task_and_advance(conn: psycopg.Connection, worker_id: str, task: d
                 str(task["task_id"]),
             )
 
-            if task["step_id"] is None or task["workflow_id"] is None:
+            if task["workflow_id"] is None:
+                return
+
+            if task["step_id"] is None:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM workflow_steps
+                    WHERE workflow_id = %s
+                    """,
+                    (task["workflow_id"],),
+                )
+                step_count = cur.fetchone()[0]
+                if step_count != 0:
+                    return
+
+                cur.execute(
+                    """
+                    INSERT INTO workflow_checkpoints (
+                        workflow_id,
+                        step_name,
+                        state_json,
+                        created_by
+                    ) VALUES (%s, %s, %s, %s)
+                    RETURNING checkpoint_id
+                    """,
+                    (
+                        task["workflow_id"],
+                        "implicit_task_completion",
+                        Json({"completed_task_id": str(task["task_id"])}),
+                        worker_id,
+                    ),
+                )
+                checkpoint_id = cur.fetchone()[0]
+                _audit(
+                    cur,
+                    worker_id,
+                    "workflow_checkpointed",
+                    "workflow",
+                    str(task["workflow_id"]),
+                    str(task["workflow_id"]),
+                    None,
+                    str(task["task_id"]),
+                )
+                logger.info("workflow checkpoint written (workflow_id=%s)", task["workflow_id"])
+
+                cur.execute(
+                    """
+                    UPDATE workflows
+                    SET status = 'completed',
+                        completed_at = now(),
+                        checkpoint_id = %s,
+                        updated_at = now()
+                    WHERE workflow_id = %s
+                    """,
+                    (checkpoint_id, task["workflow_id"]),
+                )
+                _audit(
+                    cur,
+                    worker_id,
+                    "workflow_completed",
+                    "workflow",
+                    str(task["workflow_id"]),
+                    str(task["workflow_id"]),
+                    None,
+                    str(task["task_id"]),
+                )
+                logger.info("workflow marked completed (workflow_id=%s)", task["workflow_id"])
                 return
 
             cur.execute(
@@ -463,6 +542,7 @@ def _complete_task_and_advance(conn: psycopg.Connection, worker_id: str, task: d
                 str(task["step_id"]),
                 str(task["task_id"]),
             )
+            logger.info("workflow step completed (step_id=%s)", task["step_id"])
 
             cur.execute(
                 """
@@ -498,6 +578,7 @@ def _complete_task_and_advance(conn: psycopg.Connection, worker_id: str, task: d
                 str(task["step_id"]),
                 str(task["task_id"]),
             )
+            logger.info("workflow checkpoint written (workflow_id=%s)", task["workflow_id"])
 
             if next_step is None:
                 cur.execute(
@@ -521,6 +602,7 @@ def _complete_task_and_advance(conn: psycopg.Connection, worker_id: str, task: d
                     str(task["step_id"]),
                     str(task["task_id"]),
                 )
+                logger.info("workflow marked completed (workflow_id=%s)", task["workflow_id"])
             else:
                 cur.execute(
                     """
@@ -569,7 +651,7 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
         return
 
     _execute_noop(conn, worker_id, task)
-    _complete_task_and_advance(conn, worker_id, task)
+    _complete_task_and_advance(conn, worker_id, task, logger)
     logger.info("task completed (task_id=%s)", task["task_id"])
 
 
@@ -654,7 +736,7 @@ def main() -> None:
 
         if readiness.get()[0]:
             try:
-                task = _claim_task(conn, worker_id) if conn is not None else None
+                task = _claim_task(conn, worker_id, logger) if conn is not None else None
             except Exception as exc:
                 logger.error("task claim failed: %s", exc)
                 task = None

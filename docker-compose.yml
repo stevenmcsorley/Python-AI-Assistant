@@ -51,6 +51,7 @@ services:
       FALLBACK_PROVIDER: ${FALLBACK_PROVIDER:-ollama}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      NOOP_DURATION_SECONDS: ${NOOP_DURATION_SECONDS:-2}
     depends_on:
       postgres:
         condition: service_started

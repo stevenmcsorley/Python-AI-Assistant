@@ -38,7 +38,7 @@ This document defines the physical PostgreSQL schema for the Python AI Assistant
 - **Key fields:** `workflow_id`, `step_id`, `task_type`, `status`, `idempotency_key`, `input_json`, `output_json`, `attempts`, `max_attempts`, `lease_owner`, `lease_expires_at`, `started_at`, `completed_at`, `error_details`
 - **Relationships:** `tasks` 1→N `task_attempts`, `tool_executions`, `audit_log`.
 
-### task_attempts (immutable)
+### task_attempts (status mutable)
 - **Purpose:** Track retries and outcomes.
 - **Primary key:** `task_attempt_id`
 - **Key fields:** `task_id`, `attempt_number`, `status`, `started_at`, `ended_at`, `worker_id`, `error_details`
@@ -120,7 +120,6 @@ This document defines the physical PostgreSQL schema for the Python AI Assistant
 
 ### Immutable (append‑only)
 - `workflow_checkpoints`
-- `task_attempts`
 - `tool_executions`
 - `artifact_versions`
 - `sources`
@@ -137,6 +136,7 @@ This document defines the physical PostgreSQL schema for the Python AI Assistant
 - `workflows`, `workflow_steps`, `tasks`, `jobs`
 - `signals`, `intents`, `suggestions`
 - `artifacts` (pointer to latest version)
+ - `task_attempts` (status, ended_at, error_details)
 
 ## 7. Indexing Strategy (v1)
 
