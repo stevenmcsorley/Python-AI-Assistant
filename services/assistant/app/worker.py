@@ -135,6 +135,42 @@ def _env_int(name: str, default: int) -> int:
         raise SystemExit(f"invalid integer for {name}: {value}")
 
 
+def _configure_logging(service: str, worker_id: str) -> None:
+    old_factory = logging.getLogRecordFactory()
+
+    def record_factory(*args, **kwargs):  # type: ignore[override]
+        record = old_factory(*args, **kwargs)
+        if not hasattr(record, "service"):
+            record.service = service
+        if not hasattr(record, "worker_id"):
+            record.worker_id = worker_id
+        if not hasattr(record, "entity_id"):
+            record.entity_id = "-"
+        return record
+
+    logging.setLogRecordFactory(record_factory)
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s service=%(service)s worker_id=%(worker_id)s entity_id=%(entity_id)s message=%(message)s",
+    )
+
+
+def _validate_env() -> dict:
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        raise SystemExit("DATABASE_URL is required")
+
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+    deepseek_base = os.getenv("DEEPSEEK_API_BASE")
+
+    return {
+        "database_url_set": True,
+        "deepseek_key_set": bool(deepseek_key),
+        "deepseek_base_set": bool(deepseek_base),
+        "deepseek_enabled": bool(deepseek_key and deepseek_base),
+    }
+
+
 def _check_required_tables(conn: psycopg.Connection) -> tuple[bool, str]:
     with conn.cursor() as cur:
         cur.execute(
@@ -336,6 +372,41 @@ def _audit_invariant_violation(
         payload.get("task_id"),
         payload,
     )
+
+
+def _audit_worker_shutdown(conn: psycopg.Connection, worker_id: str) -> None:
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _audit(
+                    cur,
+                    worker_id,
+                    "worker_shutdown",
+                    "worker",
+                    worker_id,
+                    None,
+                    None,
+                    None,
+                    {},
+                )
+    except Exception:
+        return
+
+
+def _expire_lease(conn: psycopg.Connection, worker_id: str, task_id: str) -> None:
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE tasks
+                SET lease_expires_at = now(),
+                    updated_at = now()
+                WHERE task_id = %s
+                  AND lease_owner = %s
+                  AND status = 'running'
+                """,
+                (task_id, worker_id),
+            )
 
 
 def _claim_task(conn: psycopg.Connection, worker_id: str, logger: logging.Logger) -> dict | None:
@@ -1545,24 +1616,35 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
 
 
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+    config = _validate_env()
+    worker_id = os.getenv("WORKER_ID") or str(uuid.uuid4())
+    _configure_logging("worker", worker_id)
     logger = logging.getLogger("worker")
 
-    dsn = os.getenv("DATABASE_URL")
-    if not dsn:
-        raise SystemExit("DATABASE_URL is required")
-
-    worker_id = os.getenv("WORKER_ID") or str(uuid.uuid4())
+    dsn = os.getenv("DATABASE_URL") or ""
+    logger.info(
+        "config validated: deepseek_enabled=%s deepseek_key_set=%s deepseek_base_set=%s",
+        config["deepseek_enabled"],
+        config["deepseek_key_set"],
+        config["deepseek_base_set"],
+    )
     listen_host = os.getenv("WORKER_HOST", "0.0.0.0")
     listen_port = _env_int("WORKER_PORT", 8001)
     readiness_interval = _env_int("READINESS_CHECK_SECONDS", 10)
     delivery_interval = _env_int("MESSAGE_DELIVERY_INTERVAL_SECONDS", 5)
 
     stop_event = threading.Event()
+    shutdown_requested = {"value": False}
+    current_task_id = {"value": None}
+    processing_task = {"value": False}
     readiness = _ReadinessState()
 
     def handle_signal(signum: int, _frame: object) -> None:
         logger.info("shutdown signal received: %s", signum)
+        shutdown_requested["value"] = True
+        readiness.set(False, "shutdown")
+        if processing_task["value"]:
+            logger.info("shutdown requested: finishing current task")
         stop_event.set()
 
     signal.signal(signal.SIGTERM, handle_signal)
@@ -1581,6 +1663,7 @@ def main() -> None:
         logger.error("db connection failed on startup: %s", exc)
 
     last_ready = None
+    ready_logged = False
     logger.info("worker started (worker_id=%s), readiness checks every %ss", worker_id, readiness_interval)
 
     def check_readiness() -> tuple[bool, str]:
@@ -1609,6 +1692,9 @@ def main() -> None:
     state = "READY" if ready else "NOT READY"
     logger.info("readiness state: %s (%s)", state, message)
     last_ready = ready
+    if ready and not ready_logged:
+        logger.info("ready")
+        ready_logged = True
 
     poll_interval = _env_int("WORKER_POLL_SECONDS", 5)
     last_ready_check = 0.0
@@ -1623,6 +1709,9 @@ def main() -> None:
                 state = "READY" if ready else "NOT READY"
                 logger.info("readiness state: %s (%s)", state, message)
                 last_ready = ready
+            if ready and not ready_logged:
+                logger.info("ready")
+                ready_logged = True
             last_ready_check = now
 
         if readiness.get()[0] and now - last_delivery_check >= delivery_interval:
@@ -1641,6 +1730,8 @@ def main() -> None:
                 task = None
 
             if task is not None:
+                current_task_id["value"] = str(task["task_id"])
+                processing_task["value"] = True
                 try:
                     _process_task(conn, worker_id, task, logger)
                 except Exception as exc:
@@ -1649,9 +1740,20 @@ def main() -> None:
                         _mark_failed(conn, worker_id, task, f"execution_error: {exc}")
                     except Exception as inner_exc:
                         logger.error("failed to mark task failed: %s", inner_exc)
+                finally:
+                    processing_task["value"] = False
+                    current_task_id["value"] = None
                 continue
 
         stop_event.wait(poll_interval)
+
+    if shutdown_requested["value"] and conn is not None:
+        if current_task_id["value"] and not processing_task["value"]:
+            try:
+                _expire_lease(conn, worker_id, current_task_id["value"])
+            except Exception as exc:
+                logger.error("failed to release lease on shutdown: %s", exc)
+        _audit_worker_shutdown(conn, worker_id)
 
     logger.info("shutting down")
     httpd.shutdown()

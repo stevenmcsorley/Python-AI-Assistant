@@ -4,6 +4,7 @@ import os
 import signal
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .signals import NullSignalSource, SignalSource, SignalWriter, SyntheticSignalSource
@@ -29,6 +30,43 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         raise SystemExit(f"invalid integer for {name}: {value}")
+
+
+def _configure_logging(service: str, orchestrator_id: str) -> None:
+    old_factory = logging.getLogRecordFactory()
+
+    def record_factory(*args, **kwargs):  # type: ignore[override]
+        record = old_factory(*args, **kwargs)
+        if not hasattr(record, "service"):
+            record.service = service
+        if not hasattr(record, "orchestrator_id"):
+            record.orchestrator_id = orchestrator_id
+        if not hasattr(record, "entity_id"):
+            record.entity_id = "-"
+        return record
+
+    logging.setLogRecordFactory(record_factory)
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s service=%(service)s orchestrator_id=%(orchestrator_id)s entity_id=%(entity_id)s message=%(message)s",
+    )
+
+
+def _validate_env() -> dict:
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        raise SystemExit("DATABASE_URL is required")
+
+    use_synthetic = os.getenv("INGEST_SYNTHETIC_SIGNALS", "false").lower() == "true"
+    user_id = os.getenv("DEFAULT_USER_ID", "")
+    if use_synthetic and not user_id:
+        raise SystemExit("DEFAULT_USER_ID is required when INGEST_SYNTHETIC_SIGNALS=true")
+
+    return {
+        "database_url_set": True,
+        "ingest_synthetic_signals": use_synthetic,
+        "default_user_id_set": bool(user_id),
+    }
 
 
 def _check_db_ready(dsn: str) -> tuple[bool, str]:
@@ -409,12 +447,17 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
 
 
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+    config = _validate_env()
+    orchestrator_id = os.getenv("ORCHESTRATOR_ID") or str(uuid.uuid4())
+    _configure_logging("orchestrator", orchestrator_id)
     logger = logging.getLogger("orchestrator")
 
-    dsn = os.getenv("DATABASE_URL")
-    if not dsn:
-        raise SystemExit("DATABASE_URL is required")
+    dsn = os.getenv("DATABASE_URL") or ""
+    logger.info(
+        "config validated: ingest_synthetic_signals=%s default_user_id_set=%s",
+        config["ingest_synthetic_signals"],
+        config["default_user_id_set"],
+    )
 
     listen_host = os.getenv("ORCHESTRATOR_HOST", "0.0.0.0")
     listen_port = _env_int("ORCHESTRATOR_PORT", 8000)
@@ -422,9 +465,13 @@ def main() -> None:
 
     stop_event = threading.Event()
     readiness = _ReadinessState()
+    httpd_ref: dict[str, ThreadingHTTPServer | None] = {"server": None}
 
     def handle_signal(signum: int, _frame: object) -> None:
         logger.info("shutdown signal received: %s", signum)
+        readiness.set(False, "shutdown")
+        if httpd_ref["server"] is not None:
+            httpd_ref["server"].shutdown()
         stop_event.set()
 
     signal.signal(signal.SIGTERM, handle_signal)
@@ -432,10 +479,12 @@ def main() -> None:
 
     handler_cls = _make_handler(readiness)
     httpd = ThreadingHTTPServer((listen_host, listen_port), handler_cls)
+    httpd_ref["server"] = httpd
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
 
     last_ready = None
+    ready_logged = False
     logger.info("orchestrator started, readiness checks every %ss", readiness_interval)
 
     ready, message = _check_db_ready(dsn)
@@ -443,6 +492,9 @@ def main() -> None:
     state = "READY" if ready else "NOT READY"
     logger.info("readiness state: %s (%s)", state, message)
     last_ready = ready
+    if ready and not ready_logged:
+        logger.info("ready")
+        ready_logged = True
     if ready:
         planned, steps_created = plan_pending_workflows(dsn, actor_id="orchestrator")
         if planned:
@@ -466,6 +518,9 @@ def main() -> None:
             state = "READY" if ready else "NOT READY"
             logger.info("readiness state: %s (%s)", state, message)
             last_ready = ready
+        if ready and not ready_logged:
+            logger.info("ready")
+            ready_logged = True
 
     logger.info("shutting down")
     httpd.shutdown()
