@@ -8,6 +8,7 @@ const {
 
 const PORT = Number(process.env.PORT || 3000);
 const ORCHESTRATOR_URL = 'http://orchestrator:8000/whatsapp';
+const WEBHOOK_SECRET = process.env.WHATSAPP_WEBHOOK_SECRET || '';
 
 let socket = null;
 let isReady = false;
@@ -67,9 +68,13 @@ async function startSocket() {
       if (!text) continue;
       logStatus('inbound message', { from, text });
       try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (WEBHOOK_SECRET) {
+          headers['X-Webhook-Secret'] = WEBHOOK_SECRET;
+        }
         await fetch(ORCHESTRATOR_URL, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers,
           body: JSON.stringify({ from, text }),
         });
       } catch (err) {

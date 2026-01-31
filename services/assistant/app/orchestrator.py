@@ -413,6 +413,17 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                     self.end_headers()
                     self.wfile.write(msg.encode("utf-8"))
                     return
+                webhook_secret = (os.getenv("WHATSAPP_WEBHOOK_SECRET") or "").strip()
+                if webhook_secret:
+                    provided_secret = self.headers.get("X-Webhook-Secret")
+                    if provided_secret != webhook_secret:
+                        logging.getLogger("orchestrator").warning(
+                            "whatsapp webhook rejected: invalid secret"
+                        )
+                        self.send_response(401)
+                        self.end_headers()
+                        self.wfile.write(b"unauthorized")
+                        return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                 except ValueError:

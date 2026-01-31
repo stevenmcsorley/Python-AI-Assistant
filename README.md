@@ -46,6 +46,12 @@ To enable real WhatsApp delivery, set:
 WHATSAPP_PROVIDER=baileys
 ```
 
+To secure inbound WhatsApp commands, set:
+```
+WHATSAPP_WEBHOOK_SECRET=your_shared_secret
+```
+Baileys will forward inbound messages with the `X-Webhook-Secret` header.
+
 ### 3) Configure DeepSeek (synthesize task)
 Set in your environment or `.env`:
 ```
