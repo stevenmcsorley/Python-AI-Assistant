@@ -31,6 +31,7 @@ def deliver_queued_message(
                 return False
 
             columns = _message_columns(cur)
+            did_work = False
             select_columns = [
                 "message_id",
                 "user_id",
@@ -54,107 +55,106 @@ def deliver_queued_message(
                 """
             )
             message = cur.fetchone()
-            if not message:
-                return False
+            if message:
+                did_work = True
 
-            if message.get("channel") != "whatsapp":
-                _mark_failed(
-                    cur,
-                    worker_id,
-                    message_id=str(message["message_id"]),
-                    provider=provider.name,
-                    message_type=str(message.get("message_type") or ""),
-                    channel=str(message.get("channel") or ""),
-                    error_details="unsupported_channel",
-                    columns=columns,
-                )
-                return True
+                if message.get("channel") != "whatsapp":
+                    _mark_failed(
+                        cur,
+                        worker_id,
+                        message_id=str(message["message_id"]),
+                        provider=provider.name,
+                        message_type=str(message.get("message_type") or ""),
+                        channel=str(message.get("channel") or ""),
+                        error_details="unsupported_channel",
+                        columns=columns,
+                    )
+                else:
+                    quiet_blocked, quiet_retry = _quiet_hours_blocked()
+                    if quiet_blocked:
+                        _audit_delay_once(
+                            cur,
+                            worker_id=worker_id,
+                            action_type="message_delayed_quiet_hours",
+                            message_id=str(message["message_id"]),
+                            metadata={
+                                "channel": "whatsapp",
+                                "message_type": str(message.get("message_type") or ""),
+                                "reason": "quiet_hours",
+                                "retry_after_seconds": quiet_retry,
+                            },
+                        )
+                        _LOGGER.info(
+                            "message delayed (quiet hours) (message_id=%s message_type=%s)",
+                            message["message_id"],
+                            message.get("message_type"),
+                        )
+                    else:
+                        rate_blocked, rate_retry = _rate_limit_blocked(
+                            cur,
+                            user_id=str(message["user_id"]),
+                        )
+                        if rate_blocked:
+                            _audit_delay_once(
+                                cur,
+                                worker_id=worker_id,
+                                action_type="message_delayed_rate_limit",
+                                message_id=str(message["message_id"]),
+                                metadata={
+                                    "channel": "whatsapp",
+                                    "message_type": str(message.get("message_type") or ""),
+                                    "reason": "rate_limit",
+                                    "retry_after_seconds": rate_retry,
+                                },
+                            )
+                            _LOGGER.info(
+                                "message delayed (rate limit) (message_id=%s message_type=%s)",
+                                message["message_id"],
+                                message.get("message_type"),
+                            )
+                        else:
+                            _LOGGER.info(
+                                "message delivery intent (message_id=%s message_type=%s)",
+                                message["message_id"],
+                                message.get("message_type"),
+                            )
 
-            quiet_blocked, quiet_retry = _quiet_hours_blocked()
-            if quiet_blocked:
-                _audit_delay_once(
-                    cur,
-                    worker_id=worker_id,
-                    action_type="message_delayed_quiet_hours",
-                    message_id=str(message["message_id"]),
-                    metadata={
-                        "channel": "whatsapp",
-                        "message_type": str(message.get("message_type") or ""),
-                        "reason": "quiet_hours",
-                        "retry_after_seconds": quiet_retry,
-                    },
-                )
-                _LOGGER.info(
-                    "message delayed (quiet hours) (message_id=%s message_type=%s)",
-                    message["message_id"],
-                    message.get("message_type"),
-                )
-                return True
+                            success, error = provider.deliver(message)
+                            if success:
+                                _mark_sent(
+                                    cur,
+                                    worker_id,
+                                    message_id=str(message["message_id"]),
+                                    provider=provider.name,
+                                    message_type=str(message.get("message_type") or ""),
+                                    channel=str(message.get("channel") or ""),
+                                    columns=columns,
+                                )
+                                _LOGGER.info(
+                                    "message delivered (message_id=%s message_type=%s)",
+                                    message["message_id"],
+                                    message.get("message_type"),
+                                )
+                            else:
+                                _mark_failed(
+                                    cur,
+                                    worker_id,
+                                    message_id=str(message["message_id"]),
+                                    provider=provider.name,
+                                    message_type=str(message.get("message_type") or ""),
+                                    channel=str(message.get("channel") or ""),
+                                    error_details=error or "delivery_failed",
+                                    columns=columns,
+                                )
+                                _LOGGER.warning(
+                                    "message delivery failed (message_id=%s message_type=%s error=%s)",
+                                    message["message_id"],
+                                    message.get("message_type"),
+                                    error,
+                                )
 
-            rate_blocked, rate_retry = _rate_limit_blocked(
-                cur,
-                user_id=str(message["user_id"]),
-            )
-            if rate_blocked:
-                _audit_delay_once(
-                    cur,
-                    worker_id=worker_id,
-                    action_type="message_delayed_rate_limit",
-                    message_id=str(message["message_id"]),
-                    metadata={
-                        "channel": "whatsapp",
-                        "message_type": str(message.get("message_type") or ""),
-                        "reason": "rate_limit",
-                        "retry_after_seconds": rate_retry,
-                    },
-                )
-                _LOGGER.info(
-                    "message delayed (rate limit) (message_id=%s message_type=%s)",
-                    message["message_id"],
-                    message.get("message_type"),
-                )
-                return True
-
-            _LOGGER.info(
-                "message delivery intent (message_id=%s message_type=%s)",
-                message["message_id"],
-                message.get("message_type"),
-            )
-
-            success, error = provider.deliver(message)
-            if success:
-                _mark_sent(
-                    cur,
-                    worker_id,
-                    message_id=str(message["message_id"]),
-                    provider=provider.name,
-                    message_type=str(message.get("message_type") or ""),
-                    channel=str(message.get("channel") or ""),
-                    columns=columns,
-                )
-                _LOGGER.info(
-                    "message delivered (message_id=%s message_type=%s)",
-                    message["message_id"],
-                    message.get("message_type"),
-                )
-            else:
-                _mark_failed(
-                    cur,
-                    worker_id,
-                    message_id=str(message["message_id"]),
-                    provider=provider.name,
-                    message_type=str(message.get("message_type") or ""),
-                    channel=str(message.get("channel") or ""),
-                    error_details=error or "delivery_failed",
-                    columns=columns,
-                )
-                _LOGGER.warning(
-                    "message delivery failed (message_id=%s message_type=%s error=%s)",
-                    message["message_id"],
-                    message.get("message_type"),
-                    error,
-                )
-            return True
+            reminder_created = _enqueue_reminder_if_due(cur, worker_id, columns)
+            return did_work or reminder_created
 
 
 def _messages_table_exists(cur: psycopg.Cursor) -> bool:
@@ -186,6 +186,144 @@ def _message_columns(cur: psycopg.Cursor) -> dict[str, bool]:
         "error_details": has_column("error_details"),
         "updated_at": has_column("updated_at"),
     }
+
+
+def _enqueue_reminder_if_due(
+    cur: psycopg.Cursor,
+    worker_id: str,
+    columns: dict[str, bool],
+) -> bool:
+    sent_at_expr = "sent_at" if columns["sent_at"] else "NULL::timestamptz AS sent_at"
+    order_expr = "COALESCE(sent_at, m.created_at)" if columns["sent_at"] else "m.created_at"
+    cur.execute(
+        f"""
+        SELECT m.message_id,
+               m.user_id,
+               m.related_entity_id,
+               m.created_at,
+               {sent_at_expr}
+        FROM messages m
+        JOIN suggestions s ON m.related_entity_id = s.suggestion_id
+        WHERE m.message_type = 'suggestion_ready'
+          AND m.status = 'sent'
+          AND s.status = 'queued'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM approvals a
+            WHERE a.suggestion_id = s.suggestion_id
+              AND a.decision IN ('approved','denied')
+          )
+        ORDER BY {order_expr} ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 25
+        """
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return False
+
+    now_utc = datetime.now(timezone.utc)
+    for row in rows:
+        message_id = str(row.get("message_id"))
+        user_id = str(row.get("user_id"))
+        suggestion_id = str(row.get("related_entity_id"))
+        sent_at = row.get("sent_at") if columns["sent_at"] else None
+        created_at = row.get("created_at")
+        timestamp = sent_at or created_at
+        if timestamp is None:
+            continue
+
+        cur.execute(
+            """
+            SELECT COUNT(*) AS reminder_count
+            FROM messages
+            WHERE message_type = 'suggestion_reminder'
+              AND related_entity_id = %s
+            """,
+            (suggestion_id,),
+        )
+        count_row = cur.fetchone()
+        if isinstance(count_row, dict):
+            reminder_count = count_row.get("reminder_count") or 0
+        else:
+            reminder_count = count_row[0] or 0
+        if reminder_count >= 2:
+            continue
+
+        reminder_number = reminder_count + 1
+        delay_hours = 24 if reminder_number == 1 else 72
+        elapsed_hours = (now_utc - timestamp).total_seconds() / 3600.0
+        if elapsed_hours < delay_hours:
+            continue
+
+        cur.execute(
+            """
+            SELECT 1
+            FROM audit_log
+            WHERE action_type = 'message_reminder_queued'
+              AND entity_type = 'suggestion'
+              AND entity_id = %s
+              AND metadata->>'reminder_number' = %s
+            LIMIT 1
+            """,
+            (suggestion_id, str(reminder_number)),
+        )
+        if cur.fetchone():
+            continue
+
+        body = (
+            "Just checking in - would you like me to proceed with this suggestion? "
+            f"Reply approve {suggestion_id} or deny {suggestion_id}."
+        )
+        cur.execute(
+            """
+            INSERT INTO messages (
+                message_id,
+                user_id,
+                channel,
+                message_type,
+                body,
+                status,
+                related_entity_type,
+                related_entity_id,
+                created_at
+            ) VALUES (
+                gen_random_uuid(),
+                %s,
+                'whatsapp',
+                'suggestion_reminder',
+                %s,
+                'queued',
+                'suggestion',
+                %s,
+                now()
+            )
+            RETURNING message_id
+            """,
+            (user_id, body, suggestion_id),
+        )
+        reminder_row = cur.fetchone()
+        if isinstance(reminder_row, dict):
+            reminder_message_id = str(reminder_row.get("message_id"))
+        else:
+            reminder_message_id = str(reminder_row[0])
+        _audit_reminder_queued(
+            cur,
+            actor_id=worker_id,
+            suggestion_id=suggestion_id,
+            reminder_number=reminder_number,
+            original_message_id=message_id,
+            delay_hours=delay_hours,
+        )
+        _LOGGER.info(
+            "reminder queued (suggestion_id=%s reminder_number=%s message_id=%s)",
+            suggestion_id,
+            reminder_number,
+            reminder_message_id,
+        )
+        return True
+
+    return False
 
 
 def _quiet_hours_blocked() -> tuple[bool, int]:
@@ -402,3 +540,49 @@ def _audit_delay_once(
     if cur.fetchone():
         return
     _audit_message(cur, worker_id, action_type, message_id, metadata)
+
+
+def _audit_reminder_queued(
+    cur: psycopg.Cursor,
+    actor_id: str,
+    suggestion_id: str,
+    reminder_number: int,
+    original_message_id: str,
+    delay_hours: int,
+) -> None:
+    digest = hashlib.sha256(
+        f"{actor_id}:message_reminder_queued:{suggestion_id}:{time.time_ns()}".encode("utf-8")
+    ).hexdigest()
+    cur.execute(
+        """
+        INSERT INTO audit_log (
+            actor_type,
+            actor_id,
+            action_type,
+            entity_type,
+            entity_id,
+            audit_hash,
+            metadata
+        ) VALUES (
+            'worker',
+            %s,
+            'message_reminder_queued',
+            'suggestion',
+            %s,
+            %s,
+            %s
+        )
+        """,
+        (
+            actor_id,
+            suggestion_id,
+            digest,
+            Json(
+                {
+                    "reminder_number": reminder_number,
+                    "original_message_id": original_message_id,
+                    "delay_hours": delay_hours,
+                }
+            ),
+        ),
+    )
