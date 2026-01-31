@@ -18,6 +18,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from .messages import Message, MessageWriter, deliver_queued_message
+from .llm import DeepSeekError, DeepSeekResponse, run_chat_completion
 
 REQUIRED_TABLES = ("tasks", "task_attempts", "audit_log")
 LEASE_DURATION_SECONDS = 120
@@ -456,6 +457,7 @@ def _mark_failed(
     worker_id: str,
     task: dict,
     error_details: str,
+    audit_metadata: dict | None = None,
 ) -> None:
     with conn.transaction():
         with conn.cursor() as cur:
@@ -526,6 +528,9 @@ def _mark_failed(
                     {"task_id": str(task["task_id"]), "attempt": task["attempts"]},
                 )
                 return
+            metadata = {"error": error_details}
+            if audit_metadata:
+                metadata.update(audit_metadata)
             _audit(
                 cur,
                 worker_id,
@@ -535,7 +540,7 @@ def _mark_failed(
                 str(task["workflow_id"]) if task["workflow_id"] else None,
                 str(task["step_id"]) if task["step_id"] else None,
                 str(task["task_id"]),
-                {"error": error_details},
+                metadata,
             )
 
             if task["step_id"] is not None:
@@ -594,6 +599,7 @@ def _mark_task_failed_only(
     worker_id: str,
     task: dict,
     error_details: str,
+    audit_metadata: dict | None = None,
 ) -> None:
     with conn.transaction():
         with conn.cursor() as cur:
@@ -664,6 +670,9 @@ def _mark_task_failed_only(
                     {"task_id": str(task["task_id"]), "attempt": task["attempts"]},
                 )
                 return
+            metadata = {"error": error_details}
+            if audit_metadata:
+                metadata.update(audit_metadata)
             _audit(
                 cur,
                 worker_id,
@@ -673,7 +682,7 @@ def _mark_task_failed_only(
                 str(task["workflow_id"]) if task["workflow_id"] else None,
                 str(task["step_id"]) if task["step_id"] else None,
                 str(task["task_id"]),
-                {"error": error_details},
+                metadata,
             )
 
 
@@ -683,6 +692,7 @@ def _complete_task_and_advance(
     task: dict,
     logger: logging.Logger,
     output_json: dict | None = None,
+    audit_metadata: dict | None = None,
 ) -> None:
     payload = output_json if output_json is not None else {"status": "ok"}
     workflow_completed = False
@@ -764,6 +774,7 @@ def _complete_task_and_advance(
                 str(task["workflow_id"]) if task["workflow_id"] else None,
                 str(task["step_id"]) if task["step_id"] else None,
                 str(task["task_id"]),
+                audit_metadata or {},
             )
 
             if task["workflow_id"] is None:
@@ -882,6 +893,71 @@ def _execute_stub(task: dict, logger: logging.Logger) -> dict:
         "task_type": task["task_type"],
         "note": "stub execution only",
     }
+
+
+def _elapsed_ms(start: float) -> int:
+    return int((time.monotonic() - start) * 1000)
+
+
+def _collect_synthesis_inputs(conn: psycopg.Connection, task: dict) -> tuple[list[str], list[dict]]:
+    if task.get("step_id") is None:
+        return [], []
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT task_id, output_json
+            FROM tasks
+            WHERE step_id = %s
+              AND task_id != %s
+              AND status = 'completed'
+              AND output_json IS NOT NULL
+            ORDER BY created_at ASC
+            """,
+            (task["step_id"], task["task_id"]),
+        )
+        rows = cur.fetchall()
+    input_task_ids = [str(row["task_id"]) for row in rows]
+    outputs = [row["output_json"] for row in rows]
+    return input_task_ids, outputs
+
+
+def _execute_synthesize_llm(
+    conn: psycopg.Connection,
+    task: dict,
+    logger: logging.Logger,
+) -> tuple[dict | None, str | None, int]:
+    start = time.monotonic()
+    input_task_ids, outputs = _collect_synthesis_inputs(conn, task)
+    if not outputs:
+        return None, "missing_inputs", _elapsed_ms(start)
+
+    try:
+        inputs_json = json.dumps(outputs, sort_keys=True)
+    except (TypeError, ValueError):
+        return None, "input_serialization_failed", _elapsed_ms(start)
+
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    api_base = os.getenv("DEEPSEEK_API_BASE")
+    try:
+        response: DeepSeekResponse = run_chat_completion(api_key, api_base, inputs_json)
+    except DeepSeekError as exc:
+        logger.error("deepseek request failed (task_id=%s reason=%s)", task["task_id"], exc.reason)
+        return None, exc.reason, _elapsed_ms(start)
+
+    summary = response.summary.strip()
+    if not summary:
+        return None, "empty_response", _elapsed_ms(start)
+
+    output = {
+        "model": "deepseek-chat",
+        "summary": summary,
+        "input_task_ids": input_task_ids,
+        "token_usage": {
+            "prompt": response.prompt_tokens,
+            "completion": response.completion_tokens,
+        },
+    }
+    return output, None, _elapsed_ms(start)
 
 
 def _create_workflow_output(
@@ -1404,6 +1480,38 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
         )
         if tool.name == "web_fetch" and sandbox_type == "local":
             _execute_web_fetch(conn, worker_id, task, tool_exec_id, input_payload, logger)
+        if task_type == "synthesize":
+            output, failure_reason, duration_ms = _execute_synthesize_llm(conn, task, logger)
+            if failure_reason:
+                _mark_task_failed_only(
+                    conn,
+                    worker_id,
+                    task,
+                    failure_reason,
+                    audit_metadata={
+                        "model": "deepseek-chat",
+                        "reason": failure_reason,
+                        "duration_ms": duration_ms,
+                    },
+                )
+                logger.error(
+                    "synthesize failed (task_id=%s reason=%s)", task["task_id"], failure_reason
+                )
+                return
+            _complete_task_and_advance(
+                conn,
+                worker_id,
+                task,
+                logger,
+                output_json=output,
+                audit_metadata={
+                    "model": "deepseek-chat",
+                    "duration_ms": duration_ms,
+                },
+            )
+            logger.info("task completed (task_id=%s)", task["task_id"])
+            return
+
         output = _execute_stub(task, logger)
         if task_type == "read_sources":
             summary = _consume_web_fetch_results(conn, worker_id, task)
