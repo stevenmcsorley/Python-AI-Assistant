@@ -81,16 +81,11 @@ def parse_command(text: str) -> tuple[ParsedCommand | None, str | None]:
     return None, "unknown_command"
 
 
-def handle_inbound_text(dsn: str, user_id: str, text: str) -> tuple[int, str]:
+def handle_inbound_text(dsn: str, phone: str, text: str) -> tuple[int, str]:
     logger = logging.getLogger("messages.inbound")
-    if not user_id:
-        _audit_rejection_best_effort(dsn, "unknown", "missing_user_id", text)
-        return 400, "user_id is required"
-    try:
-        user_uuid = str(uuid.UUID(user_id))
-    except ValueError:
-        _audit_rejection_best_effort(dsn, "unknown", "invalid_user_id", text)
-        return 400, "invalid user_id"
+    if not phone:
+        _audit_rejection_best_effort(dsn, "unknown", "missing_phone", text)
+        return 400, "phone is required"
 
     command, error = parse_command(text)
     if error:
@@ -110,17 +105,22 @@ def handle_inbound_text(dsn: str, user_id: str, text: str) -> tuple[int, str]:
     with psycopg.connect(dsn) as conn:
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_uuid,))
-                if not cur.fetchone():
+                cur.execute(
+                    "SELECT user_id FROM users WHERE whatsapp_phone = %s",
+                    (phone,),
+                )
+                row = cur.fetchone()
+                if not row:
                     _audit_command(
                         cur,
-                        actor_id=user_uuid,
+                        actor_id=phone,
                         action_type="command_rejected",
                         entity_type="user",
-                        entity_id=user_uuid,
-                        metadata={"reason": "user_not_found"},
+                        entity_id=None,
+                        metadata={"reason": "unknown_whatsapp_user", "phone": phone},
                     )
                     return 404, "user not found"
+                user_uuid = str(row[0])
 
                 if command is None:
                     _audit_command(

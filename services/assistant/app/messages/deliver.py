@@ -143,29 +143,8 @@ def deliver_queued_message(
                                     pref_reason,
                                 )
                             else:
-                                _LOGGER.info(
-                                    "message delivery intent (message_id=%s message_type=%s)",
-                                    message["message_id"],
-                                    message.get("message_type"),
-                                )
-
-                                success, error = provider.deliver(message)
-                                if success:
-                                    _mark_sent(
-                                        cur,
-                                        worker_id,
-                                        message_id=str(message["message_id"]),
-                                        provider=provider.name,
-                                        message_type=str(message.get("message_type") or ""),
-                                        channel=str(message.get("channel") or ""),
-                                        columns=columns,
-                                    )
-                                    _LOGGER.info(
-                                        "message delivered (message_id=%s message_type=%s)",
-                                        message["message_id"],
-                                        message.get("message_type"),
-                                    )
-                                else:
+                                phone = _resolve_whatsapp_phone(cur, str(message["user_id"]))
+                                if not phone:
                                     _mark_failed(
                                         cur,
                                         worker_id,
@@ -173,15 +152,55 @@ def deliver_queued_message(
                                         provider=provider.name,
                                         message_type=str(message.get("message_type") or ""),
                                         channel=str(message.get("channel") or ""),
-                                        error_details=error or "delivery_failed",
+                                        error_details="missing_whatsapp_phone",
                                         columns=columns,
                                     )
                                     _LOGGER.warning(
-                                        "message delivery failed (message_id=%s message_type=%s error=%s)",
+                                        "message delivery failed (message_id=%s message_type=%s error=missing_whatsapp_phone)",
                                         message["message_id"],
                                         message.get("message_type"),
-                                        error,
                                     )
+                                else:
+                                    message["to"] = phone
+                                    _LOGGER.info(
+                                        "message delivery intent (message_id=%s message_type=%s)",
+                                        message["message_id"],
+                                        message.get("message_type"),
+                                    )
+
+                                    success, error = provider.deliver(message)
+                                    if success:
+                                        _mark_sent(
+                                            cur,
+                                            worker_id,
+                                            message_id=str(message["message_id"]),
+                                            provider=provider.name,
+                                            message_type=str(message.get("message_type") or ""),
+                                            channel=str(message.get("channel") or ""),
+                                            columns=columns,
+                                        )
+                                        _LOGGER.info(
+                                            "message delivered (message_id=%s message_type=%s)",
+                                            message["message_id"],
+                                            message.get("message_type"),
+                                        )
+                                    else:
+                                        _mark_failed(
+                                            cur,
+                                            worker_id,
+                                            message_id=str(message["message_id"]),
+                                            provider=provider.name,
+                                            message_type=str(message.get("message_type") or ""),
+                                            channel=str(message.get("channel") or ""),
+                                            error_details=error or "delivery_failed",
+                                            columns=columns,
+                                        )
+                                        _LOGGER.warning(
+                                            "message delivery failed (message_id=%s message_type=%s error=%s)",
+                                            message["message_id"],
+                                            message.get("message_type"),
+                                            error,
+                                        )
 
             reminder_created = _enqueue_reminder_if_due(cur, worker_id, columns)
             return did_work or reminder_created
@@ -194,6 +213,20 @@ def _messages_table_exists(cur: psycopg.Cursor) -> bool:
         return False
     value = next(iter(row.values()))
     return value is not None
+
+
+def _resolve_whatsapp_phone(cur: psycopg.Cursor, user_id: str) -> str | None:
+    cur.execute("SELECT whatsapp_phone FROM users WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    if isinstance(row, dict):
+        value = row.get("whatsapp_phone")
+    else:
+        value = row[0]
+    if not value:
+        return None
+    return str(value)
 
 
 def _message_columns(cur: psycopg.Cursor) -> dict[str, bool]:

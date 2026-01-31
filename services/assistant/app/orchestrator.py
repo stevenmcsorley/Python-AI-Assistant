@@ -425,19 +425,19 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                     self.end_headers()
                     self.wfile.write(b"invalid json")
                     return
-                user_id = payload.get("user_id")
+                phone = payload.get("from")
                 text = payload.get("text")
-                if not isinstance(user_id, str) or not user_id:
+                if not isinstance(phone, str) or not phone:
                     self.send_response(400)
                     self.end_headers()
-                    self.wfile.write(b"user_id is required")
+                    self.wfile.write(b"from is required")
                     return
                 if not isinstance(text, str) or not text:
                     self.send_response(400)
                     self.end_headers()
                     self.wfile.write(b"text is required")
                     return
-                status_code, response_text = handle_inbound_text(dsn, user_id, text)
+                status_code, response_text = handle_inbound_text(dsn, phone, text)
                 self.send_response(status_code)
                 self.end_headers()
                 self.wfile.write(response_text.encode("utf-8"))
