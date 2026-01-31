@@ -1,5 +1,6 @@
 services:
   orchestrator:
+    user: "${UID}:${GID}"
     build:
       context: ./services/assistant
     command: ["python", "-m", "app.orchestrator"]
@@ -42,6 +43,7 @@ services:
     restart: unless-stopped
 
   worker:
+    user: "${UID}:${GID}"
     build:
       context: ./services/assistant
     command: ["python", "-m", "app.worker"]
