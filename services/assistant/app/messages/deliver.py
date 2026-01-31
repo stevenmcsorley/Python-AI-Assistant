@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 from psycopg.rows import dict_row
@@ -64,6 +67,51 @@ def deliver_queued_message(
                     channel=str(message.get("channel") or ""),
                     error_details="unsupported_channel",
                     columns=columns,
+                )
+                return True
+
+            quiet_blocked, quiet_retry = _quiet_hours_blocked()
+            if quiet_blocked:
+                _audit_delay_once(
+                    cur,
+                    worker_id=worker_id,
+                    action_type="message_delayed_quiet_hours",
+                    message_id=str(message["message_id"]),
+                    metadata={
+                        "channel": "whatsapp",
+                        "message_type": str(message.get("message_type") or ""),
+                        "reason": "quiet_hours",
+                        "retry_after_seconds": quiet_retry,
+                    },
+                )
+                _LOGGER.info(
+                    "message delayed (quiet hours) (message_id=%s message_type=%s)",
+                    message["message_id"],
+                    message.get("message_type"),
+                )
+                return True
+
+            rate_blocked, rate_retry = _rate_limit_blocked(
+                cur,
+                user_id=str(message["user_id"]),
+            )
+            if rate_blocked:
+                _audit_delay_once(
+                    cur,
+                    worker_id=worker_id,
+                    action_type="message_delayed_rate_limit",
+                    message_id=str(message["message_id"]),
+                    metadata={
+                        "channel": "whatsapp",
+                        "message_type": str(message.get("message_type") or ""),
+                        "reason": "rate_limit",
+                        "retry_after_seconds": rate_retry,
+                    },
+                )
+                _LOGGER.info(
+                    "message delayed (rate limit) (message_id=%s message_type=%s)",
+                    message["message_id"],
+                    message.get("message_type"),
                 )
                 return True
 
@@ -138,6 +186,88 @@ def _message_columns(cur: psycopg.Cursor) -> dict[str, bool]:
         "error_details": has_column("error_details"),
         "updated_at": has_column("updated_at"),
     }
+
+
+def _quiet_hours_blocked() -> tuple[bool, int]:
+    enabled = os.getenv("QUIET_HOURS_ENABLED", "false").lower() == "true"
+    if not enabled:
+        return False, 0
+    try:
+        start_hour = int(os.getenv("QUIET_HOURS_START", "22"))
+        end_hour = int(os.getenv("QUIET_HOURS_END", "8"))
+    except ValueError:
+        return False, 0
+    if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+        return False, 0
+
+    tz_name = os.getenv("USER_TIMEZONE", "UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        tz = timezone.utc
+
+    now_local = datetime.now(tz)
+    if start_hour == end_hour:
+        return False, 0
+
+    if start_hour < end_hour:
+        in_quiet = start_hour <= now_local.hour < end_hour
+        if not in_quiet:
+            return False, 0
+        end_time = now_local.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+        if end_time <= now_local:
+            end_time = end_time + timedelta(days=1)
+    else:
+        in_quiet = now_local.hour >= start_hour or now_local.hour < end_hour
+        if not in_quiet:
+            return False, 0
+        if now_local.hour >= start_hour:
+            end_time = (now_local + timedelta(days=1)).replace(
+                hour=end_hour, minute=0, second=0, microsecond=0
+            )
+        else:
+            end_time = now_local.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+
+    retry_after = int((end_time - now_local).total_seconds())
+    return True, max(retry_after, 0)
+
+
+def _rate_limit_blocked(cur: psycopg.Cursor, user_id: str) -> tuple[bool, int]:
+    try:
+        limit = int(os.getenv("MESSAGE_RATE_LIMIT_COUNT", "3"))
+        window_seconds = int(os.getenv("MESSAGE_RATE_LIMIT_WINDOW_SECONDS", "300"))
+    except ValueError:
+        return False, 0
+    if limit <= 0 or window_seconds <= 0:
+        return False, 0
+
+    now_utc = datetime.now(timezone.utc)
+    window_start = now_utc - timedelta(seconds=window_seconds)
+    cur.execute(
+        """
+        SELECT COUNT(*) AS message_count, MIN(a.timestamp) AS earliest_sent
+        FROM audit_log a
+        JOIN messages m ON a.entity_id = m.message_id
+        WHERE a.action_type = 'message_sent'
+          AND a.entity_type = 'message'
+          AND m.user_id = %s
+          AND a.timestamp >= %s
+        """,
+        (user_id, window_start),
+    )
+    row = cur.fetchone()
+    if isinstance(row, dict):
+        count = row.get("message_count")
+        earliest = row.get("earliest_sent")
+    else:
+        count, earliest = row
+    if count is None or int(count) < limit:
+        return False, 0
+    retry_after = window_seconds
+    if earliest is not None:
+        delta = (now_utc - earliest).total_seconds()
+        retry_after = max(window_seconds - int(delta), 0)
+    return True, retry_after
 
 
 def _mark_sent(
@@ -249,3 +379,26 @@ def _audit_message(
         """,
         (actor_id, action_type, message_id, digest, Json(metadata)),
     )
+
+
+def _audit_delay_once(
+    cur: psycopg.Cursor,
+    worker_id: str,
+    action_type: str,
+    message_id: str,
+    metadata: dict,
+) -> None:
+    cur.execute(
+        """
+        SELECT 1
+        FROM audit_log
+        WHERE action_type = %s
+          AND entity_type = 'message'
+          AND entity_id = %s
+        LIMIT 1
+        """,
+        (action_type, message_id),
+    )
+    if cur.fetchone():
+        return
+    _audit_message(cur, worker_id, action_type, message_id, metadata)
