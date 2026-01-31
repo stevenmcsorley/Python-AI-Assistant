@@ -1546,43 +1546,43 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
         return
 
     task_type = task["task_type"]
-    if task_type == "noop":
-        _execute_noop(conn, worker_id, task)
-        _complete_task_and_advance(conn, worker_id, task, logger)
-        logger.info("task completed (task_id=%s)", task["task_id"])
-        return
-
-        if task_type == "synthesize":
-            output, failure_reason, duration_ms, input_count = _execute_synthesize_llm(
-                conn, task, logger
-            )
-            if failure_reason:
-                _mark_task_failed_only(
-                    conn,
-                    worker_id,
-                    task,
-                    failure_reason,
-                    audit_metadata={
-                        "model": "deepseek-chat",
-                        "reason": failure_reason,
-                        "duration_ms": duration_ms,
-                        "input_count": input_count,
-                    },
-                )
-                logger.error("synthesize failed (task_id=%s reason=%s)", task["task_id"], failure_reason)
-                return
-            _complete_task_and_advance(
+    if task_type == "synthesize":
+        output, failure_reason, duration_ms, input_count = _execute_synthesize_llm(
+            conn, task, logger
+        )
+        if failure_reason:
+            _mark_task_failed_only(
                 conn,
                 worker_id,
                 task,
-                logger,
-                output_json=output,
+                failure_reason,
                 audit_metadata={
                     "model": "deepseek-chat",
+                    "reason": failure_reason,
                     "duration_ms": duration_ms,
                     "input_count": input_count,
                 },
             )
+            logger.error("synthesize failed (task_id=%s reason=%s)", task["task_id"], failure_reason)
+            return
+        _complete_task_and_advance(
+            conn,
+            worker_id,
+            task,
+            logger,
+            output_json=output,
+            audit_metadata={
+                "model": "deepseek-chat",
+                "duration_ms": duration_ms,
+                "input_count": input_count,
+            },
+        )
+        logger.info("task completed (task_id=%s)", task["task_id"])
+        return
+
+    if task_type == "noop":
+        _execute_noop(conn, worker_id, task)
+        _complete_task_and_advance(conn, worker_id, task, logger)
         logger.info("task completed (task_id=%s)", task["task_id"])
         return
 
