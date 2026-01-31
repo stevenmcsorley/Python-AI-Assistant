@@ -141,15 +141,11 @@ def handle_inbound_text(dsn: str, phone: str, text: str) -> tuple[int, str]:
                     return 400, "command rejected"
 
                 if command.name == "help":
-                    _audit_command(
-                        cur,
-                        actor_id=user_uuid,
-                        action_type="command_processed",
-                        entity_type="user",
-                        entity_id=user_uuid,
-                        metadata={"command": "help"},
+                    return _handle_help(
+                        cur=cur,
+                        dsn=dsn,
+                        user_id=user_uuid,
                     )
-                    return 200, HELP_TEXT
 
                 if command.name == "research":
                     return _handle_research_request(
@@ -427,6 +423,45 @@ def _handle_status(
             metadata={"command": "status", "message_id": message_id},
         )
     return 200, body
+
+
+def _handle_help(
+    cur: psycopg.Cursor,
+    dsn: str,
+    user_id: str,
+) -> tuple[int, str]:
+    message_writer = MessageWriter(dsn, actor_id=f"whatsapp:{user_id}", actor_type="whatsapp")
+    message = Message(
+        user_id=user_id,
+        channel="whatsapp",
+        message_type="help",
+        body=HELP_TEXT,
+        status="queued",
+        related_entity_type="user",
+        related_entity_id=user_id,
+    )
+    message_id, created = message_writer.write(message, cur=cur)
+    if message_id:
+        message_writer.render_message(message_id, cur=cur)
+    if not created:
+        _audit_command(
+            cur,
+            actor_id=user_id,
+            action_type="command_noop",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"command": "help", "reason": "message_exists"},
+        )
+    else:
+        _audit_command(
+            cur,
+            actor_id=user_id,
+            action_type="command_processed",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"command": "help", "message_id": message_id},
+        )
+    return 200, HELP_TEXT
 
 
 def _handle_approval(
