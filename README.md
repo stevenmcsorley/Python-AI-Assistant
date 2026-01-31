@@ -25,3 +25,17 @@ This repository is a build-ready skeleton based on the PRD and Runtime Architect
 - Orchestrator and worker are placeholders and simply stay alive.
 - Obsidian vault is mounted at `/obsidian` inside containers.
 - Set provider credentials and scheduling in `.env`.
+
+## Baileys WhatsApp Sidecar (Optional)
+
+Baileys is a standalone WhatsApp Web bridge. It is not required for the system to run.
+
+**Warning:** Baileys is non-contractual and may break.
+
+### Start Baileys
+- Start only the sidecar: `docker compose up -d baileys`
+
+### QR Auth
+- On first start, a QR code is printed to the Baileys container logs.
+- Scan the QR code with WhatsApp on your phone to authenticate.
+- Auth state is persisted in the `baileys_auth` volume.

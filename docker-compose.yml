@@ -71,6 +71,17 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  baileys:
+    image: node:20
+    working_dir: /app
+    command: ["sh", "-c", "npm install && npm start"]
+    volumes:
+      - ./services/baileys:/app
+      - baileys_auth:/app/auth
+    expose:
+      - "3000"
+    restart: unless-stopped
+
   postgres:
     image: pgvector/pgvector:pg16
     environment:
@@ -166,6 +177,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  baileys_auth:
   temporal_data:
   ollama_data:
   qdrant_data:
