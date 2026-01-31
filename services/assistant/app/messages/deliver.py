@@ -11,6 +11,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from .preferences import evaluate_delivery_preferences, get_user_delivery_preferences
 from .providers import DeliveryProvider, WhatsAppStubProvider
 
 _LOGGER = logging.getLogger("messages.delivery")
@@ -113,45 +114,74 @@ def deliver_queued_message(
                                 message.get("message_type"),
                             )
                         else:
-                            _LOGGER.info(
-                                "message delivery intent (message_id=%s message_type=%s)",
-                                message["message_id"],
-                                message.get("message_type"),
+                            prefs = get_user_delivery_preferences(cur, str(message["user_id"]))
+                            pref_blocked, pref_reason, pref_retry = (
+                                evaluate_delivery_preferences(
+                                    prefs,
+                                    str(message.get("channel") or ""),
+                                    datetime.now(timezone.utc),
+                                )
                             )
-
-                            success, error = provider.deliver(message)
-                            if success:
-                                _mark_sent(
+                            if pref_blocked and pref_reason:
+                                _audit_delay_reason_once(
                                     cur,
-                                    worker_id,
+                                    worker_id=worker_id,
+                                    action_type="message_delayed_user_pref",
                                     message_id=str(message["message_id"]),
-                                    provider=provider.name,
-                                    message_type=str(message.get("message_type") or ""),
-                                    channel=str(message.get("channel") or ""),
-                                    columns=columns,
+                                    reason=pref_reason,
+                                    metadata={
+                                        "channel": "whatsapp",
+                                        "message_type": str(message.get("message_type") or ""),
+                                        "reason": pref_reason,
+                                        "retry_after_seconds": pref_retry,
+                                    },
                                 )
                                 _LOGGER.info(
-                                    "message delivered (message_id=%s message_type=%s)",
+                                    "message delayed (user preference) (message_id=%s message_type=%s reason=%s)",
                                     message["message_id"],
                                     message.get("message_type"),
+                                    pref_reason,
                                 )
                             else:
-                                _mark_failed(
-                                    cur,
-                                    worker_id,
-                                    message_id=str(message["message_id"]),
-                                    provider=provider.name,
-                                    message_type=str(message.get("message_type") or ""),
-                                    channel=str(message.get("channel") or ""),
-                                    error_details=error or "delivery_failed",
-                                    columns=columns,
-                                )
-                                _LOGGER.warning(
-                                    "message delivery failed (message_id=%s message_type=%s error=%s)",
+                                _LOGGER.info(
+                                    "message delivery intent (message_id=%s message_type=%s)",
                                     message["message_id"],
                                     message.get("message_type"),
-                                    error,
                                 )
+
+                                success, error = provider.deliver(message)
+                                if success:
+                                    _mark_sent(
+                                        cur,
+                                        worker_id,
+                                        message_id=str(message["message_id"]),
+                                        provider=provider.name,
+                                        message_type=str(message.get("message_type") or ""),
+                                        channel=str(message.get("channel") or ""),
+                                        columns=columns,
+                                    )
+                                    _LOGGER.info(
+                                        "message delivered (message_id=%s message_type=%s)",
+                                        message["message_id"],
+                                        message.get("message_type"),
+                                    )
+                                else:
+                                    _mark_failed(
+                                        cur,
+                                        worker_id,
+                                        message_id=str(message["message_id"]),
+                                        provider=provider.name,
+                                        message_type=str(message.get("message_type") or ""),
+                                        channel=str(message.get("channel") or ""),
+                                        error_details=error or "delivery_failed",
+                                        columns=columns,
+                                    )
+                                    _LOGGER.warning(
+                                        "message delivery failed (message_id=%s message_type=%s error=%s)",
+                                        message["message_id"],
+                                        message.get("message_type"),
+                                        error,
+                                    )
 
             reminder_created = _enqueue_reminder_if_due(cur, worker_id, columns)
             return did_work or reminder_created
@@ -536,6 +566,31 @@ def _audit_delay_once(
         LIMIT 1
         """,
         (action_type, message_id),
+    )
+    if cur.fetchone():
+        return
+    _audit_message(cur, worker_id, action_type, message_id, metadata)
+
+
+def _audit_delay_reason_once(
+    cur: psycopg.Cursor,
+    worker_id: str,
+    action_type: str,
+    message_id: str,
+    reason: str,
+    metadata: dict,
+) -> None:
+    cur.execute(
+        """
+        SELECT 1
+        FROM audit_log
+        WHERE action_type = %s
+          AND entity_type = 'message'
+          AND entity_id = %s
+          AND metadata->>'reason' = %s
+        LIMIT 1
+        """,
+        (action_type, message_id, reason),
     )
     if cur.fetchone():
         return

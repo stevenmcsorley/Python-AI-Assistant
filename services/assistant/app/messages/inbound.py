@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
+import os
 import time
 import uuid
 
 import psycopg
 from psycopg.types.json import Json
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..approvals import Approval, ApprovalWriter
 from .models import Message
@@ -16,7 +19,8 @@ from .writer import MessageWriter
 
 HELP_TEXT = (
     "Supported commands: approve <suggestion_id>, deny <suggestion_id>, "
-    "status <workflow_id>, help"
+    "status <workflow_id>, mute, unmute, snooze 2h, snooze until YYYY-MM-DD HH:MM, "
+    "unsnooze, channels whatsapp,email, help"
 )
 
 
@@ -24,6 +28,7 @@ HELP_TEXT = (
 class ParsedCommand:
     name: str
     target_id: str | None
+    args: dict | None = None
 
 
 def parse_command(text: str) -> tuple[ParsedCommand | None, str | None]:
@@ -46,6 +51,33 @@ def parse_command(text: str) -> tuple[ParsedCommand | None, str | None]:
         except ValueError:
             return None, "invalid_target"
         return ParsedCommand(name=command, target_id=target_uuid), None
+    if command in ("mute", "unmute", "unsnooze"):
+        if len(parts) != 1:
+            return None, "unexpected_arguments"
+        return ParsedCommand(name=command, target_id=None), None
+    if command == "snooze":
+        if len(parts) == 2 and parts[1].lower().endswith("h"):
+            value = parts[1].lower()[:-1]
+            if not value.isdigit():
+                return None, "invalid_snooze"
+            hours = int(value)
+            if hours <= 0:
+                return None, "invalid_snooze"
+            return ParsedCommand(name="snooze", target_id=None, args={"duration_hours": hours}), None
+        if len(parts) == 4 and parts[1].lower() == "until":
+            return ParsedCommand(
+                name="snooze",
+                target_id=None,
+                args={"until_date": parts[2], "until_time": parts[3]},
+            ), None
+        return None, "invalid_snooze"
+    if command == "channels":
+        if len(parts) != 2:
+            return None, "invalid_channels"
+        channels = [segment.strip().lower() for segment in parts[1].split(",") if segment.strip()]
+        if not channels:
+            return None, "invalid_channels"
+        return ParsedCommand(name="channels", target_id=None, args={"channels": channels}), None
     return None, "unknown_command"
 
 
@@ -127,6 +159,12 @@ def handle_inbound_text(dsn: str, user_id: str, text: str) -> tuple[int, str]:
                         user_id=user_uuid,
                         suggestion_id=command.target_id or "",
                         decision=command.name,
+                    )
+                if command.name in ("mute", "unmute", "snooze", "unsnooze", "channels"):
+                    return _handle_delivery_preferences(
+                        cur=cur,
+                        user_id=user_uuid,
+                        command=command,
                     )
 
     logger.error("unhandled command")
@@ -326,6 +364,208 @@ def _handle_approval(
         (desired_status, suggestion_id),
     )
     return 200, f"approval recorded ({approval_id})"
+
+
+def _handle_delivery_preferences(
+    cur: psycopg.Cursor,
+    user_id: str,
+    command: ParsedCommand,
+) -> tuple[int, str]:
+    if not _preferences_table_exists(cur):
+        _audit_command(
+            cur,
+            actor_id=user_id,
+            action_type="command_rejected",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"reason": "preferences_table_missing", "command": command.name},
+        )
+        return 503, "delivery preferences unavailable"
+
+    current = _fetch_preferences(cur, user_id)
+    updated = dict(current)
+    action_type = ""
+    metadata: dict = {}
+
+    if command.name == "mute":
+        updated["muted"] = True
+        action_type = "delivery_muted"
+        metadata = {"channel": "whatsapp"}
+    elif command.name == "unmute":
+        updated["muted"] = False
+        action_type = "delivery_unmuted"
+        metadata = {}
+    elif command.name == "unsnooze":
+        updated["snoozed_until"] = None
+        action_type = "delivery_unsnoozed"
+        metadata = {}
+    elif command.name == "snooze":
+        snoozed_until = _parse_snooze(command)
+        if snoozed_until is None:
+            _audit_command(
+                cur,
+                actor_id=user_id,
+                action_type="command_rejected",
+                entity_type="user",
+                entity_id=user_id,
+                metadata={"reason": "invalid_snooze", "command": "snooze"},
+            )
+            return 400, "invalid snooze command"
+        updated["snoozed_until"] = snoozed_until
+        action_type = "delivery_snoozed"
+        metadata = {"until": snoozed_until.isoformat()}
+    elif command.name == "channels":
+        channels = _parse_channels(command)
+        if not channels:
+            _audit_command(
+                cur,
+                actor_id=user_id,
+                action_type="command_rejected",
+                entity_type="user",
+                entity_id=user_id,
+                metadata={"reason": "invalid_channels", "command": "channels"},
+            )
+            return 400, "invalid channels"
+        updated["allowed_channels"] = channels
+        action_type = "delivery_channel_updated"
+        metadata = {"allowed_channels": channels}
+    else:
+        _audit_command(
+            cur,
+            actor_id=user_id,
+            action_type="command_rejected",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"reason": "unknown_command", "command": command.name},
+        )
+        return 400, "command rejected"
+
+    if _preferences_equal(current, updated):
+        _audit_command(
+            cur,
+            actor_id=user_id,
+            action_type="command_noop",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"command": command.name, "reason": "no_change"},
+        )
+        return 200, "no changes"
+
+    cur.execute(
+        """
+        INSERT INTO user_delivery_preferences (
+            user_id,
+            muted,
+            snoozed_until,
+            allowed_channels,
+            updated_at
+        ) VALUES (
+            %s, %s, %s, %s, now()
+        )
+        ON CONFLICT (user_id) DO UPDATE SET
+            muted = EXCLUDED.muted,
+            snoozed_until = EXCLUDED.snoozed_until,
+            allowed_channels = EXCLUDED.allowed_channels,
+            updated_at = now()
+        """,
+        (
+            user_id,
+            updated["muted"],
+            updated["snoozed_until"],
+            updated["allowed_channels"],
+        ),
+    )
+    _audit_command(
+        cur,
+        actor_id=user_id,
+        action_type=action_type,
+        entity_type="user",
+        entity_id=user_id,
+        metadata=metadata,
+    )
+    return 200, "preferences updated"
+
+
+def _preferences_table_exists(cur: psycopg.Cursor) -> bool:
+    cur.execute("SELECT to_regclass('public.user_delivery_preferences')")
+    row = cur.fetchone()
+    if not row:
+        return False
+    value = row[0] if not isinstance(row, dict) else next(iter(row.values()))
+    return value is not None
+
+
+def _fetch_preferences(cur: psycopg.Cursor, user_id: str) -> dict:
+    cur.execute(
+        """
+        SELECT muted, snoozed_until, allowed_channels
+        FROM user_delivery_preferences
+        WHERE user_id = %s
+        """,
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return {
+            "muted": False,
+            "snoozed_until": None,
+            "allowed_channels": ["whatsapp"],
+        }
+    if isinstance(row, dict):
+        muted = bool(row.get("muted"))
+        snoozed_until = row.get("snoozed_until")
+        channels = row.get("allowed_channels") or []
+    else:
+        muted, snoozed_until, channels = row
+    return {
+        "muted": bool(muted),
+        "snoozed_until": snoozed_until,
+        "allowed_channels": [str(ch).lower() for ch in (channels or [])],
+    }
+
+
+def _parse_snooze(command: ParsedCommand) -> datetime | None:
+    args = command.args or {}
+    now_utc = datetime.now(timezone.utc)
+    if "duration_hours" in args:
+        hours = int(args["duration_hours"])
+        return now_utc + timedelta(hours=hours)
+    if "until_date" in args and "until_time" in args:
+        try:
+            target = datetime.strptime(
+                f"{args['until_date']} {args['until_time']}", "%Y-%m-%d %H:%M"
+            )
+        except ValueError:
+            return None
+        tz_name = os.getenv("USER_TIMEZONE", "UTC")
+        try:
+            tz = ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            tz = timezone.utc
+        target = target.replace(tzinfo=tz)
+        return target.astimezone(timezone.utc)
+    return None
+
+
+def _parse_channels(command: ParsedCommand) -> list[str]:
+    args = command.args or {}
+    channels = args.get("channels") or []
+    normalized = []
+    for channel in channels:
+        value = str(channel).strip().lower()
+        if value and value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def _preferences_equal(current: dict, updated: dict) -> bool:
+    if bool(current.get("muted")) != bool(updated.get("muted")):
+        return False
+    if current.get("snoozed_until") != updated.get("snoozed_until"):
+        return False
+    current_channels = [str(ch).lower() for ch in (current.get("allowed_channels") or [])]
+    updated_channels = [str(ch).lower() for ch in (updated.get("allowed_channels") or [])]
+    return current_channels == updated_channels
 
 
 def _audit_command(
