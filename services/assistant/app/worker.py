@@ -1464,6 +1464,36 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
         logger.info("task completed (task_id=%s)", task["task_id"])
         return
 
+    if task_type == "synthesize":
+        output, failure_reason, duration_ms = _execute_synthesize_llm(conn, task, logger)
+        if failure_reason:
+            _mark_task_failed_only(
+                conn,
+                worker_id,
+                task,
+                failure_reason,
+                audit_metadata={
+                    "model": "deepseek-chat",
+                    "reason": failure_reason,
+                    "duration_ms": duration_ms,
+                },
+            )
+            logger.error("synthesize failed (task_id=%s reason=%s)", task["task_id"], failure_reason)
+            return
+        _complete_task_and_advance(
+            conn,
+            worker_id,
+            task,
+            logger,
+            output_json=output,
+            audit_metadata={
+                "model": "deepseek-chat",
+                "duration_ms": duration_ms,
+            },
+        )
+        logger.info("task completed (task_id=%s)", task["task_id"])
+        return
+
     if task_type in STUB_TASK_TYPES:
         tool_name = TASK_TOOL_MAPPING.get(task_type)
         if tool_name is None:
@@ -1480,37 +1510,6 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
         )
         if tool.name == "web_fetch" and sandbox_type == "local":
             _execute_web_fetch(conn, worker_id, task, tool_exec_id, input_payload, logger)
-        if task_type == "synthesize":
-            output, failure_reason, duration_ms = _execute_synthesize_llm(conn, task, logger)
-            if failure_reason:
-                _mark_task_failed_only(
-                    conn,
-                    worker_id,
-                    task,
-                    failure_reason,
-                    audit_metadata={
-                        "model": "deepseek-chat",
-                        "reason": failure_reason,
-                        "duration_ms": duration_ms,
-                    },
-                )
-                logger.error(
-                    "synthesize failed (task_id=%s reason=%s)", task["task_id"], failure_reason
-                )
-                return
-            _complete_task_and_advance(
-                conn,
-                worker_id,
-                task,
-                logger,
-                output_json=output,
-                audit_metadata={
-                    "model": "deepseek-chat",
-                    "duration_ms": duration_ms,
-                },
-            )
-            logger.info("task completed (task_id=%s)", task["task_id"])
-            return
 
         output = _execute_stub(task, logger)
         if task_type == "read_sources":
