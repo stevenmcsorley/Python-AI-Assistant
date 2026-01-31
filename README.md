@@ -52,6 +52,11 @@ WHATSAPP_WEBHOOK_SECRET=your_shared_secret
 ```
 Baileys will forward inbound messages with the `X-Webhook-Secret` header.
 
+To scan the QR easily, open:
+```
+http://localhost:3000/qr.png
+```
+
 ### 3) Configure DeepSeek (synthesize task)
 Set in your environment or `.env`:
 ```

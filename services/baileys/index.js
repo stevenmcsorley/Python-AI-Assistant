@@ -5,6 +5,7 @@ const {
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
 } = require('@whiskeysockets/baileys');
+const QRCode = require('qrcode');
 
 const PORT = Number(process.env.PORT || 3000);
 const ORCHESTRATOR_URL = 'http://orchestrator:8000/whatsapp';
@@ -14,6 +15,7 @@ let socket = null;
 let isReady = false;
 let lastConnectionState = 'disconnected';
 let latestQr = null;
+let latestQrPng = null;
 
 function logStatus(message, extra = {}) {
   const payload = { level: 'info', message, ...extra };
@@ -41,6 +43,14 @@ async function startSocket() {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       latestQr = qr;
+      QRCode.toBuffer(qr, { type: 'png', margin: 1, scale: 6 }, (err, buffer) => {
+        if (err) {
+          logError('qr render failed', { error: err.message });
+          latestQrPng = null;
+          return;
+        }
+        latestQrPng = buffer;
+      });
       logStatus('qr updated');
     }
     if (connection) {
@@ -140,6 +150,17 @@ async function main() {
       return res.status(404).json({ ok: false, error: 'qr_unavailable' });
     }
     return res.json({ ok: true, status: lastConnectionState, qr: latestQr });
+  });
+
+  app.get('/qr.png', (_req, res) => {
+    if (isReady) {
+      return res.status(204).end();
+    }
+    if (!latestQrPng) {
+      return res.status(404).json({ ok: false, error: 'qr_unavailable' });
+    }
+    res.set('Content-Type', 'image/png');
+    return res.send(latestQrPng);
   });
 
   app.listen(PORT, () => {
