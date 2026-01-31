@@ -13,6 +13,7 @@ const WEBHOOK_SECRET = process.env.WHATSAPP_WEBHOOK_SECRET || '';
 let socket = null;
 let isReady = false;
 let lastConnectionState = 'disconnected';
+let latestQr = null;
 
 function logStatus(message, extra = {}) {
   const payload = { level: 'info', message, ...extra };
@@ -37,7 +38,11 @@ async function startSocket() {
   socket.ev.on('creds.update', saveCreds);
 
   socket.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+    if (qr) {
+      latestQr = qr;
+      logStatus('qr updated');
+    }
     if (connection) {
       lastConnectionState = connection;
       isReady = connection === 'open';
@@ -125,6 +130,16 @@ async function main() {
       logError('send failed', { error: err.message, to });
       return res.status(503).json({ ok: false, error: err.message });
     }
+  });
+
+  app.get('/qr', (_req, res) => {
+    if (isReady) {
+      return res.json({ ok: true, status: 'connected', qr: null });
+    }
+    if (!latestQr) {
+      return res.status(404).json({ ok: false, error: 'qr_unavailable' });
+    }
+    return res.json({ ok: true, status: lastConnectionState, qr: latestQr });
   });
 
   app.listen(PORT, () => {
