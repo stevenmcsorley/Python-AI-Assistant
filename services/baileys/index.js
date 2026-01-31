@@ -117,7 +117,7 @@ async function sendMessage(to, text) {
   if (!socket || !isReady) {
     throw new Error('whatsapp_not_ready');
   }
-  const jid = to.includes('@s.whatsapp.net') ? to : `${to}@s.whatsapp.net`;
+  const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
   await socket.sendMessage(jid, { text });
 }
 

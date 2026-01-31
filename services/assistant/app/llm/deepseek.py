@@ -7,7 +7,7 @@ from typing import Any
 import requests
 
 MODEL_NAME = "deepseek-chat"
-MAX_TOKENS = 512
+MAX_TOKENS = 8192
 TEMPERATURE = 0.2
 TIMEOUT_SECONDS = 30
 
