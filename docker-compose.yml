@@ -59,6 +59,9 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
       NOOP_DURATION_SECONDS: ${NOOP_DURATION_SECONDS:-2}
       WHATSAPP_PROVIDER: ${WHATSAPP_PROVIDER:-}
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      BRAVE_SEARCH_API_BASE: ${BRAVE_SEARCH_API_BASE:-}
+      BRAVE_SEARCH_MAX_RESULTS: ${BRAVE_SEARCH_MAX_RESULTS:-5}
     depends_on:
       postgres:
         condition: service_started

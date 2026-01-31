@@ -53,18 +53,26 @@ DEEPSEEK_API_BASE=https://api.deepseek.com
 DEEPSEEK_API_KEY=your_key_here
 ```
 
-### 4) Create a user and bind WhatsApp phone
+### 4) Configure Brave Search (web research)
+Set in your environment or `.env`:
+```
+BRAVE_SEARCH_API_KEY=your_key_here
+BRAVE_SEARCH_API_BASE=https://api.search.brave.com/res/v1/web/search
+BRAVE_SEARCH_MAX_RESULTS=5
+```
+
+### 5) Create a user and bind WhatsApp phone
 ```
 INSERT INTO users (user_id, whatsapp_phone, display_name, timezone, status)
 VALUES ('00000000-0000-0000-0000-000000000001', '+447900000000', 'Demo User', 'UTC', 'active');
 ```
 
-### 5) Trigger ingest
+### 6) Trigger ingest
 ```
 curl -X POST http://localhost:8000/ingest
 ```
 
-### 6) Approve via WhatsApp
+### 7) Approve via WhatsApp
 You will receive a `suggestion_ready` message. Reply:
 ```
 approve <suggestion_id>
@@ -77,11 +85,18 @@ curl -X POST http://localhost:8000/whatsapp \
   -d '{"from":"+447900000000","text":"approve <suggestion_id>"}'
 ```
 
-### 7) Result
+### 8) Result
 Once approved:
 - Workflow runs to completion
 - Obsidian draft note is created under `obsidian-vault/`
 - WhatsApp updates are queued/sent (stub by default)
+
+### WhatsApp research command
+From WhatsApp, you can start a research workflow directly:
+```
+research <topic>
+```
+This creates a research workflow, searches the web via Brave, reads source pages, and produces a synthesized Obsidian draft note.
 
 ## Notes
 - Orchestrator runs ingestion/approval/planning; worker runs execution and delivery loops.

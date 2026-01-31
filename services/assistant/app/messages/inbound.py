@@ -18,7 +18,7 @@ from .writer import MessageWriter
 
 
 HELP_TEXT = (
-    "Supported commands: approve <suggestion_id>, deny <suggestion_id>, "
+    "Supported commands: research <topic>, approve <suggestion_id>, deny <suggestion_id>, "
     "status <workflow_id>, mute, unmute, snooze 2h, snooze until YYYY-MM-DD HH:MM, "
     "unsnooze, channels whatsapp,email, help"
 )
@@ -43,6 +43,13 @@ def parse_command(text: str) -> tuple[ParsedCommand | None, str | None]:
         if len(parts) != 1:
             return None, "unexpected_arguments"
         return ParsedCommand(name="help", target_id=None), None
+    if command == "research":
+        if len(parts) < 2:
+            return None, "missing_topic"
+        topic = raw[len(parts[0]) + 1 :].strip()
+        if not topic:
+            return None, "missing_topic"
+        return ParsedCommand(name="research", target_id=None, args={"topic": topic}), None
     if command in ("approve", "deny", "status"):
         if len(parts) != 2:
             return None, "missing_target"
@@ -144,6 +151,14 @@ def handle_inbound_text(dsn: str, phone: str, text: str) -> tuple[int, str]:
                     )
                     return 200, HELP_TEXT
 
+                if command.name == "research":
+                    return _handle_research_request(
+                        cur=cur,
+                        dsn=dsn,
+                        user_id=user_uuid,
+                        command=command,
+                    )
+
                 if command.name == "status":
                     return _handle_status(
                         cur=cur,
@@ -169,6 +184,172 @@ def handle_inbound_text(dsn: str, phone: str, text: str) -> tuple[int, str]:
 
     logger.error("unhandled command")
     return 400, "command rejected"
+
+
+def _handle_research_request(
+    cur: psycopg.Cursor,
+    dsn: str,
+    user_id: str,
+    command: ParsedCommand,
+) -> tuple[int, str]:
+    args = command.args or {}
+    topic = str(args.get("topic") or "").strip()
+    if not topic:
+        _audit_command(
+            cur,
+            actor_id=user_id,
+            action_type="command_rejected",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"command": "research", "reason": "missing_topic"},
+        )
+        return 400, "missing topic"
+    if len(topic) > 200:
+        _audit_command(
+            cur,
+            actor_id=user_id,
+            action_type="command_rejected",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"command": "research", "reason": "topic_too_long"},
+        )
+        return 400, "topic too long"
+
+    cur.execute(
+        """
+        INSERT INTO workflows (
+            user_id,
+            type,
+            status,
+            priority,
+            started_at,
+            created_at,
+            updated_at
+        ) VALUES (
+            %s, 'research', 'pending', 0, now(), now(), now()
+        )
+        RETURNING workflow_id
+        """,
+        (user_id,),
+    )
+    workflow_id = str(cur.fetchone()[0])
+
+    digest = hashlib.sha256(
+        f"whatsapp:{user_id}:workflow_created:{workflow_id}:{time.time_ns()}".encode("utf-8")
+    ).hexdigest()
+    cur.execute(
+        """
+        INSERT INTO audit_log (
+            actor_type,
+            actor_id,
+            action_type,
+            entity_type,
+            entity_id,
+            audit_hash,
+            metadata
+        ) VALUES (
+            'whatsapp',
+            %s,
+            'workflow_created',
+            'workflow',
+            %s,
+            %s,
+            %s
+        )
+        """,
+        (
+            f"whatsapp:{user_id}",
+            workflow_id,
+            digest,
+            Json({"source": "whatsapp", "command": "research", "topic": topic}),
+        ),
+    )
+
+    from ..workflows import WorkflowStepPlanner
+    from ..tasks import TaskPlanner
+
+    planner = WorkflowStepPlanner(actor_id=f"whatsapp:{user_id}")
+    try:
+        planner.ensure_steps(
+            cur,
+            workflow_id=workflow_id,
+            workflow_type="research",
+            workflow_status="pending",
+        )
+    except ValueError as exc:
+        _audit_command(
+            cur,
+            actor_id=user_id,
+            action_type="command_rejected",
+            entity_type="workflow",
+            entity_id=workflow_id,
+            metadata={"command": "research", "reason": str(exc)},
+        )
+        return 400, str(exc)
+
+    cur.execute(
+        """
+        UPDATE workflow_steps
+        SET input_json = %s, updated_at = now()
+        WHERE workflow_id = %s
+          AND step_key = 'collect_sources'
+        """,
+        (Json({"query": topic}), workflow_id),
+    )
+
+    task_planner = TaskPlanner(actor_id=f"whatsapp:{user_id}")
+    cur.execute(
+        """
+        SELECT step_id, step_key, status
+        FROM workflow_steps
+        WHERE workflow_id = %s
+        ORDER BY step_index ASC
+        """,
+        (workflow_id,),
+    )
+    for step_id, step_key, step_status in cur.fetchall():
+        try:
+            task_planner.ensure_tasks(
+                cur,
+                step_id=str(step_id),
+                workflow_id=workflow_id,
+                step_key=str(step_key),
+                step_status=str(step_status),
+            )
+        except ValueError as exc:
+            _audit_command(
+                cur,
+                actor_id=user_id,
+                action_type="command_rejected",
+                entity_type="workflow_step",
+                entity_id=str(step_id),
+                metadata={"command": "research", "reason": str(exc)},
+            )
+            return 400, str(exc)
+
+    message_writer = MessageWriter(dsn, actor_id=f"whatsapp:{user_id}", actor_type="whatsapp")
+    message = Message(
+        user_id=user_id,
+        channel="whatsapp",
+        message_type="workflow_started",
+        body="I've started researching this for you. I'll update you when there's a draft to review.",
+        status="queued",
+        related_entity_type="workflow",
+        related_entity_id=workflow_id,
+    )
+    message_id, created = message_writer.write(message, cur=cur)
+    if message_id:
+        message_writer.render_message(message_id, cur=cur)
+
+    _audit_command(
+        cur,
+        actor_id=user_id,
+        action_type="command_processed",
+        entity_type="workflow",
+        entity_id=workflow_id,
+        metadata={"command": "research", "workflow_id": workflow_id, "message_id": message_id},
+    )
+    return 200, f"research workflow created ({workflow_id})"
 
 
 def _handle_status(

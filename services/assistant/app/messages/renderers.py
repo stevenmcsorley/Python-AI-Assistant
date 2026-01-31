@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 HELP_TEXT = (
-    "Supported commands: approve <suggestion_id>, deny <suggestion_id>, "
+    "Supported commands: research <topic>, approve <suggestion_id>, deny <suggestion_id>, "
     "status <workflow_id>, help"
 )
 
