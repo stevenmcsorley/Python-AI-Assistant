@@ -1,6 +1,6 @@
-# Python AI Assistant – Repository Skeleton
+# Python AI Assistant
 
-This repository is a build-ready skeleton based on the PRD and Runtime Architecture. It contains Docker Compose layout, service placeholders, and environment configuration. No business logic is implemented yet.
+This repository implements a long-running, human-in-the-loop AI assistant. It runs via Docker Compose with an orchestrator (planning/control) and worker (execution/delivery), and produces Obsidian draft notes as outputs.
 
 ## Layout
 - `docker-compose.yml` – service topology with profiles
@@ -25,6 +25,51 @@ This repository is a build-ready skeleton based on the PRD and Runtime Architect
 1. `docker compose up -d postgres migrate`
 2. `docker compose up -d orchestrator worker`
 3. Optional: `docker compose up -d baileys`
+
+## How to Use This App (Quick Start)
+
+### 1) Start core services
+```
+docker compose up -d postgres migrate orchestrator worker
+```
+
+### 2) (Optional) Start WhatsApp sidecar
+```
+docker compose up -d baileys
+docker logs -f pythonaiassistan-baileys-1
+```
+
+Scan the QR code shown in the Baileys logs with WhatsApp to authenticate.
+
+### 3) Create a user and bind WhatsApp phone
+```
+INSERT INTO users (user_id, whatsapp_phone, display_name, timezone, status)
+VALUES ('00000000-0000-0000-0000-000000000001', '+447900000000', 'Demo User', 'UTC', 'active');
+```
+
+### 4) Trigger ingest
+```
+curl -X POST http://localhost:8000/ingest
+```
+
+### 5) Approve via WhatsApp
+You will receive a `suggestion_ready` message. Reply:
+```
+approve <suggestion_id>
+```
+
+To test without WhatsApp, you can call the inbound endpoint directly:
+```
+curl -X POST http://localhost:8000/whatsapp \
+  -H "Content-Type: application/json" \
+  -d '{"from":"+447900000000","text":"approve <suggestion_id>"}'
+```
+
+### 6) Result
+Once approved:
+- Workflow runs to completion
+- Obsidian draft note is created under `obsidian-vault/`
+- WhatsApp updates are queued/sent (stub by default)
 
 ## Notes
 - Orchestrator runs ingestion/approval/planning; worker runs execution and delivery loops.
