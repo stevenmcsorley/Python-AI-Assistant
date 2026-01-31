@@ -64,13 +64,21 @@ DEEPSEEK_API_BASE=https://api.deepseek.com
 DEEPSEEK_API_KEY=your_key_here
 ```
 
-### 4) Configure Brave Search (web research)
+### 4) Web Research Configuration
+Web research is performed using the `DuckDuckGoSearchProvider` by default, which scrapes results without requiring an API key.
+
+#### Custom Provider Configuration
+You can switch providers by setting `SEARCH_PROVIDER` to `duckduckgo` (default) or `brave`.
+
+**Brave Search (Optional)**:
 Set in your environment or `.env`:
 ```
+SEARCH_PROVIDER=brave
 BRAVE_SEARCH_API_KEY=your_key_here
 BRAVE_SEARCH_API_BASE=https://api.search.brave.com/res/v1/web/search
 BRAVE_SEARCH_MAX_RESULTS=5
 ```
+
 
 ### 5) Create a user and bind WhatsApp phone
 ```

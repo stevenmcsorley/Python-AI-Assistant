@@ -11,13 +11,14 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
-from html.parser import HTMLParser
 
-import psycopg
 import requests
-from psycopg.rows import dict_row
+import psycopg
+from psycopg.rows import dict_row 
 from psycopg.types.json import Json
 
+from app.lib.search import get_search_provider
+from app.lib.content import fetcher
 from .messages import Message, MessageWriter, deliver_queued_message
 from .messages.providers import BaileysProvider, DeliveryProvider, WhatsAppStubProvider
 from .llm import DeepSeekError, DeepSeekResponse, run_chat_completion
@@ -1068,6 +1069,60 @@ def _execute_synthesize_llm(
     return output, None, _elapsed_ms(start), input_count
 
 
+def _execute_markdown_writer(
+    conn: psycopg.Connection,
+    task: dict,
+    logger: logging.Logger,
+) -> tuple[dict | None, str | None, dict]:
+    start = time.monotonic()
+    
+    # We look for the "synthesize" task in the same workflow to get the summary
+    workflow_id = task.get("workflow_id")
+    if not workflow_id:
+         return None, "missing_workflow_id", {}
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT output_json
+            FROM tasks
+            WHERE workflow_id = %s
+              AND task_type = 'synthesize'
+              AND status = 'completed'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (workflow_id,),
+        )
+        row = cur.fetchone()
+
+    if not row or not row["output_json"]:
+         # Fallback: check if we have inputs directly provided (less common for this specific flow)
+         return None, "missing_synthesis_output", {}
+
+    synthesis_output = row["output_json"]
+    if isinstance(synthesis_output, str):
+        try:
+            synthesis_output = json.loads(synthesis_output)
+        except json.JSONDecodeError:
+            return None, "invalid_synthesis_json", {}
+            
+    summary_text = synthesis_output.get("summary", "")
+    if not summary_text:
+        return None, "empty_synthesis_summary", {}
+
+    # In a real implementation, we might want to do more formatting here,
+    # but for now, the summary from the LLM is expected to be Markdown.
+    markdown_content = summary_text
+
+    output = {
+        "markdown_content": markdown_content,
+        "source_task_id": synthesis_output.get("task_id") # This might not be present in output_json, but that's fine
+    }
+    
+    return output, None, {"content_length": len(markdown_content)}
+
+
 def _create_workflow_output(
     conn: psycopg.Connection,
     worker_id: str,
@@ -1169,26 +1224,53 @@ def _create_workflow_output(
             return str(workflow_output_id)
 
 
-def _render_obsidian_note(
+def _render_obsidian_note_v2(
     workflow_type: str,
     workflow_id: str,
     created_at: datetime,
-    summary: dict,
+    workflow_output: dict,
 ) -> str:
-    summary_json = json.dumps(summary, indent=2, sort_keys=True)
-    title = f"{workflow_type} - {workflow_id}"
+    summary_json = json.dumps(workflow_output.get("summary", {}), indent=2, sort_keys=True)
+    
+    markdown_body = ""
+    # Look for write_note step output
+    steps = workflow_output.get("steps", [])
+    for step in steps:
+        for task in step.get("tasks", []):
+            if task.get("task_type") == "write_note":
+                 out = task.get("output_json")
+                 if isinstance(out, dict):
+                     markdown_body = out.get("markdown_content", "")
+                 break
+        if markdown_body:
+            break
+            
+    if not markdown_body:
+        # Fallback to just the JSON summary if no markdown content found
+        return (
+            "---\n"
+            "status: draft\n"
+            "---\n\n"
+            f"# {workflow_type} - {workflow_id}\n\n"
+            f"Workflow Type: {workflow_type}\n\n"
+            f"Created: {created_at.isoformat()}\n\n"
+            "## Summary (JSON)\n\n"
+            "```json\n"
+            f"{summary_json}\n"
+            "```\n"
+        )
+
     return (
         "---\n"
         "status: draft\n"
         "---\n\n"
-        f"# {title}\n\n"
-        f"Workflow Type: {workflow_type}\n\n"
-        f"Created: {created_at.isoformat()}\n\n"
-        "## Summary (JSON)\n\n"
-        "```json\n"
-        f"{summary_json}\n"
-        "```\n"
+        f"# {workflow_type} - {workflow_id}\n\n"
+        f"{markdown_body}\n\n"
+        "---\n"
+        f"Workflow ID: {workflow_id}\n"
+        f"Created: {created_at.isoformat()}\n"
     )
+
 
 
 def _atomic_write(path: str, content: str) -> None:
@@ -1255,7 +1337,7 @@ def _write_obsidian_note(
     if os.path.exists(file_path):
         return
 
-    note_content = _render_obsidian_note(workflow_type, workflow_id, created_at, summary)
+    note_content = _render_obsidian_note_v2(workflow_type, workflow_id, created_at, output_json)
     try:
         _atomic_write(file_path, note_content)
     except Exception as exc:
@@ -1376,65 +1458,13 @@ def _consume_web_fetch_results(
     return summary
 
 
-class _HTMLTextExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self._chunks: list[str] = []
-
-    def handle_data(self, data: str) -> None:
-        if data and data.strip():
-            self._chunks.append(data.strip())
-
-    def get_text(self) -> str:
-        return " ".join(self._chunks)
-
-
-def _extract_text_from_html(content: bytes, max_chars: int) -> str:
-    try:
-        text = content.decode("utf-8", errors="replace")
-    except Exception:
-        text = content.decode("latin-1", errors="replace")
-    parser = _HTMLTextExtractor()
-    parser.feed(text)
-    raw = parser.get_text()
-    collapsed = " ".join(raw.split())
-    if len(collapsed) > max_chars:
-        return collapsed[:max_chars]
-    return collapsed
-
-
 def _fetch_page_text(url: str) -> tuple[dict | None, str | None]:
-    try:
-        response = requests.get(
-            url,
-            timeout=WEB_FETCH_TIMEOUT_SECONDS,
-            allow_redirects=False,
-            stream=True,
-            headers={"User-Agent": "Python-AI-Assistant/1.0"},
-        )
-    except requests.RequestException as exc:
-        return None, f"request_error:{exc}"
-
-    if response.status_code != 200:
-        return None, f"bad_status:{response.status_code}"
-    content_type = response.headers.get("Content-Type") or ""
-    if content_type and not content_type.startswith("text/"):
-        return {
-            "url": url,
-            "content_type": content_type,
-            "content_length": response.headers.get("Content-Length"),
-            "text": "",
-            "error": "unsupported_content_type",
-        }, None
-
-    data = response.raw.read(READ_SOURCE_MAX_BYTES, decode_content=True)
-    text = _extract_text_from_html(data, READ_SOURCE_MAX_CHARS)
-    return {
-        "url": url,
-        "content_type": content_type,
-        "content_length": len(data),
-        "text": text,
-    }, None
+    result, error = fetcher.fetch(url, READ_SOURCE_MAX_CHARS)
+    if error:
+        return None, error
+    if result:
+         return result, None
+    return None, "unknown_fetch_error"
 
 
 def _get_step_query(conn: psycopg.Connection, step_id: str | None) -> str | None:
@@ -1462,52 +1492,10 @@ def _get_step_query(conn: psycopg.Connection, step_id: str | None) -> str | None
 
 
 def _brave_search(query: str, max_results: int) -> tuple[list[dict], str | None]:
-    api_key = os.getenv("BRAVE_SEARCH_API_KEY")
-    if not api_key:
-        return [], "missing_brave_api_key"
-    base_url = os.getenv("BRAVE_SEARCH_API_BASE", "https://api.search.brave.com/res/v1/web/search")
-    params = {
-        "q": query,
-        "count": max_results,
-    }
-    headers = {
-        "Accept": "application/json",
-        "X-Subscription-Token": api_key,
-    }
-    try:
-        response = requests.get(
-            base_url,
-            headers=headers,
-            params=params,
-            timeout=BRAVE_SEARCH_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException as exc:
-        return [], f"request_error:{exc}"
-    if response.status_code != 200:
-        return [], f"bad_status:{response.status_code}"
-    try:
-        payload = response.json()
-    except ValueError:
-        return [], "invalid_json"
-    results = payload.get("web", {}).get("results", [])
-    if not isinstance(results, list):
-        return [], "invalid_results"
-    normalized: list[dict] = []
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        url = item.get("url") or item.get("link")
-        if not isinstance(url, str) or not url:
-            continue
-        entry = {
-            "url": url,
-            "title": str(item.get("title") or ""),
-            "description": str(item.get("description") or ""),
-        }
-        normalized.append(entry)
-        if len(normalized) >= max_results:
-            break
-    return normalized, None
+    # Determine provider (DuckDuckGo by default now, or Brave if configured)
+    # The new library handles the provider selection logic via get_search_provider()
+    provider = get_search_provider()
+    return provider.search(query, max_results)
 
 
 def _collect_fetch_sources_results(conn: psycopg.Connection, workflow_id: str) -> list[dict]:
@@ -1860,6 +1848,29 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
                 "duration_ms": duration_ms,
                 "input_count": input_count,
             },
+        )
+        logger.info("task completed (task_id=%s)", task["task_id"])
+        return
+
+    if task_type == "write_note":
+        output, failure_reason, metadata = _execute_markdown_writer(conn, task, logger)
+        if failure_reason:
+             _mark_task_failed_only(
+                conn,
+                worker_id,
+                task,
+                failure_reason,
+                audit_metadata={"reason": failure_reason}
+            )
+             logger.error("write_note failed (task_id=%s reason=%s)", task["task_id"], failure_reason)
+             return
+        _complete_task_and_advance(
+            conn,
+            worker_id,
+            task,
+            logger,
+            output_json=output,
+            audit_metadata=metadata
         )
         logger.info("task completed (task_id=%s)", task["task_id"])
         return

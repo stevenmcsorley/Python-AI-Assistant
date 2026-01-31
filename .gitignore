@@ -9,3 +9,9 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Obsidian
+obsidian-vault/*.md
+obsidian-vault/.obsidian/
+!obsidian-vault/.obsidian/plugins/
+!obsidian-vault/.obsidian/themes/
