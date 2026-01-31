@@ -21,10 +21,20 @@ This repository is a build-ready skeleton based on the PRD and Runtime Architect
 - Production-like (Temporal + Qdrant + monitoring): `docker compose --profile prod up -d`
 - Offline mode (Ollama): `docker compose --profile offline up -d`
 
+## Production Startup Order
+1. `docker compose up -d postgres migrate`
+2. `docker compose up -d orchestrator worker`
+3. Optional: `docker compose up -d baileys`
+
 ## Notes
-- Orchestrator and worker are placeholders and simply stay alive.
+- Orchestrator runs ingestion/approval/planning; worker runs execution and delivery loops.
 - Obsidian vault is mounted at `/obsidian` inside containers.
 - Set provider credentials and scheduling in `.env`.
+
+## Failure Behavior (Ops)
+- If PostgreSQL is down: orchestrator/worker readiness stays false and no work is accepted.
+- If Baileys is down: message delivery attempts fail and are audited; workflows are unaffected.
+- If DeepSeek is down or misconfigured: synthesize tasks fail with explicit reasons; other tasks continue.
 
 ## Baileys WhatsApp Sidecar (Optional)
 

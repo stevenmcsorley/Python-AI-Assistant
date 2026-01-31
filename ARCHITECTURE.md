@@ -13,6 +13,9 @@ What This System Is NOT
 - Not an autonomous agent that acts without approval.
 - Not a chat-first assistant with hidden side effects.
 - Not a background scheduler that continuously polls external systems.
+- Not using Temporal for orchestration in v1.
+- Not a streaming agent runtime.
+- Not an autonomous retry engine.
 
 Closed-Loop Execution Graph (v1)
 1. Signals ingested (manual/explicit ingest)
@@ -55,6 +58,10 @@ Safety Guarantees
 - No automatic external I/O without explicit enablement.
 - All user-visible effects are draft or queued.
 - Failures never silently mutate or erase history.
+
+Best-Effort vs Contractual
+- Contractual: PostgreSQL is the source of truth; audit log is append-only; idempotency/leases prevent duplicate state transitions.
+- Best-effort: WhatsApp transport, Baileys sidecar availability, and LLM outputs are not guaranteed and may fail without impacting core state.
 
 Data Artifacts
 - Workflow outputs are a single, canonical JSON aggregation per workflow.
