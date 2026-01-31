@@ -236,6 +236,15 @@ def _handle_status(
             entity_id=workflow_id,
             metadata={"command": "status", "reason": "message_exists"},
         )
+    else:
+        _audit_command(
+            cur,
+            actor_id=user_id,
+            action_type="command_processed",
+            entity_type="workflow",
+            entity_id=workflow_id,
+            metadata={"command": "status", "message_id": message_id},
+        )
     return 200, body
 
 
@@ -363,6 +372,14 @@ def _handle_approval(
         """,
         (desired_status, suggestion_id),
     )
+    _audit_command(
+        cur,
+        actor_id=user_id,
+        action_type="command_processed",
+        entity_type="suggestion",
+        entity_id=suggestion_id,
+        metadata={"command": decision, "approval_id": approval_id},
+    )
     return 200, f"approval recorded ({approval_id})"
 
 
@@ -482,6 +499,14 @@ def _handle_delivery_preferences(
         entity_type="user",
         entity_id=user_id,
         metadata=metadata,
+    )
+    _audit_command(
+        cur,
+        actor_id=user_id,
+        action_type="command_processed",
+        entity_type="user",
+        entity_id=user_id,
+        metadata={"command": command.name},
     )
     return 200, "preferences updated"
 

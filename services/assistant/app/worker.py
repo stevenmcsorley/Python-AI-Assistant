@@ -312,6 +312,30 @@ def _audit(
     )
 
 
+def _audit_invariant_violation(
+    cur: psycopg.Cursor,
+    actor_id: str,
+    entity_type: str,
+    entity_id: str,
+    reason: str,
+    metadata: dict | None = None,
+) -> None:
+    payload = {"reason": reason}
+    if metadata:
+        payload.update(metadata)
+    _audit(
+        cur,
+        actor_id,
+        "invariant_violation",
+        entity_type,
+        entity_id,
+        payload.get("workflow_id"),
+        payload.get("step_id"),
+        payload.get("task_id"),
+        payload,
+    )
+
+
 def _claim_task(conn: psycopg.Connection, worker_id: str, logger: logging.Logger) -> dict | None:
     with conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
@@ -401,6 +425,20 @@ def _renew_lease(conn: psycopg.Connection, worker_id: str, task: dict) -> None:
                 """,
                 (LEASE_DURATION_SECONDS, task["task_id"], worker_id),
             )
+            if cur.rowcount == 0:
+                _audit_invariant_violation(
+                    cur,
+                    worker_id,
+                    "task",
+                    str(task["task_id"]),
+                    "lease_renew_rejected",
+                    {
+                        "workflow_id": str(task["workflow_id"]) if task["workflow_id"] else None,
+                        "step_id": str(task["step_id"]) if task["step_id"] else None,
+                        "task_id": str(task["task_id"]),
+                    },
+                )
+                return
             _audit(
                 cur,
                 worker_id,
@@ -431,9 +469,40 @@ def _mark_failed(
                     lease_expires_at = NULL,
                     updated_at = now()
                 WHERE task_id = %s
+                  AND status = 'running'
+                  AND lease_owner = %s
+                  AND EXISTS (
+                      SELECT 1
+                      FROM task_attempts
+                      WHERE task_id = %s
+                        AND attempt_number = %s
+                        AND status = 'running'
+                        AND worker_id = %s
+                  )
                 """,
-                (error_details, task["task_id"]),
+                (
+                    error_details,
+                    task["task_id"],
+                    worker_id,
+                    task["task_id"],
+                    task["attempts"],
+                    worker_id,
+                ),
             )
+            if cur.rowcount == 0:
+                _audit_invariant_violation(
+                    cur,
+                    worker_id,
+                    "task",
+                    str(task["task_id"]),
+                    "task_fail_rejected",
+                    {
+                        "workflow_id": str(task["workflow_id"]) if task["workflow_id"] else None,
+                        "step_id": str(task["step_id"]) if task["step_id"] else None,
+                        "task_id": str(task["task_id"]),
+                    },
+                )
+                return
             cur.execute(
                 """
                 UPDATE task_attempts
@@ -442,9 +511,21 @@ def _mark_failed(
                     error_details = %s
                 WHERE task_id = %s
                   AND attempt_number = %s
+                  AND status = 'running'
+                  AND worker_id = %s
                 """,
-                (error_details, task["task_id"], task["attempts"]),
+                (error_details, task["task_id"], task["attempts"], worker_id),
             )
+            if cur.rowcount == 0:
+                _audit_invariant_violation(
+                    cur,
+                    worker_id,
+                    "task_attempt",
+                    str(task["task_id"]),
+                    "task_attempt_fail_rejected",
+                    {"task_id": str(task["task_id"]), "attempt": task["attempts"]},
+                )
+                return
             _audit(
                 cur,
                 worker_id,
@@ -466,19 +547,21 @@ def _mark_failed(
                         error_details = %s,
                         updated_at = now()
                     WHERE step_id = %s
+                      AND status != 'failed'
                     """,
                     (error_details, task["step_id"]),
                 )
-                _audit(
-                    cur,
-                    worker_id,
-                    "workflow_step_failed",
-                    "workflow_step",
-                    str(task["step_id"]),
-                    str(task["workflow_id"]) if task["workflow_id"] else None,
-                    str(task["step_id"]),
-                    str(task["task_id"]),
-                )
+                if cur.rowcount:
+                    _audit(
+                        cur,
+                        worker_id,
+                        "workflow_step_failed",
+                        "workflow_step",
+                        str(task["step_id"]),
+                        str(task["workflow_id"]) if task["workflow_id"] else None,
+                        str(task["step_id"]),
+                        str(task["task_id"]),
+                    )
 
             if task["workflow_id"] is not None:
                 cur.execute(
@@ -489,19 +572,21 @@ def _mark_failed(
                         error_details = %s,
                         updated_at = now()
                     WHERE workflow_id = %s
+                      AND status != 'failed'
                     """,
                     (error_details, task["workflow_id"]),
                 )
-                _audit(
-                    cur,
-                    worker_id,
-                    "workflow_failed",
-                    "workflow",
-                    str(task["workflow_id"]),
-                    str(task["workflow_id"]),
-                    str(task["step_id"]) if task["step_id"] else None,
-                    str(task["task_id"]),
-                )
+                if cur.rowcount:
+                    _audit(
+                        cur,
+                        worker_id,
+                        "workflow_failed",
+                        "workflow",
+                        str(task["workflow_id"]),
+                        str(task["workflow_id"]),
+                        str(task["step_id"]) if task["step_id"] else None,
+                        str(task["task_id"]),
+                    )
 
 
 def _mark_task_failed_only(
@@ -522,9 +607,40 @@ def _mark_task_failed_only(
                     lease_expires_at = NULL,
                     updated_at = now()
                 WHERE task_id = %s
+                  AND status = 'running'
+                  AND lease_owner = %s
+                  AND EXISTS (
+                      SELECT 1
+                      FROM task_attempts
+                      WHERE task_id = %s
+                        AND attempt_number = %s
+                        AND status = 'running'
+                        AND worker_id = %s
+                  )
                 """,
-                (error_details, task["task_id"]),
+                (
+                    error_details,
+                    task["task_id"],
+                    worker_id,
+                    task["task_id"],
+                    task["attempts"],
+                    worker_id,
+                ),
             )
+            if cur.rowcount == 0:
+                _audit_invariant_violation(
+                    cur,
+                    worker_id,
+                    "task",
+                    str(task["task_id"]),
+                    "task_fail_rejected",
+                    {
+                        "workflow_id": str(task["workflow_id"]) if task["workflow_id"] else None,
+                        "step_id": str(task["step_id"]) if task["step_id"] else None,
+                        "task_id": str(task["task_id"]),
+                    },
+                )
+                return
             cur.execute(
                 """
                 UPDATE task_attempts
@@ -533,9 +649,21 @@ def _mark_task_failed_only(
                     error_details = %s
                 WHERE task_id = %s
                   AND attempt_number = %s
+                  AND status = 'running'
+                  AND worker_id = %s
                 """,
-                (error_details, task["task_id"], task["attempts"]),
+                (error_details, task["task_id"], task["attempts"], worker_id),
             )
+            if cur.rowcount == 0:
+                _audit_invariant_violation(
+                    cur,
+                    worker_id,
+                    "task_attempt",
+                    str(task["task_id"]),
+                    "task_attempt_fail_rejected",
+                    {"task_id": str(task["task_id"]), "attempt": task["attempts"]},
+                )
+                return
             _audit(
                 cur,
                 worker_id,
@@ -571,9 +699,40 @@ def _complete_task_and_advance(
                     lease_expires_at = NULL,
                     updated_at = now()
                 WHERE task_id = %s
+                  AND status = 'running'
+                  AND lease_owner = %s
+                  AND EXISTS (
+                      SELECT 1
+                      FROM task_attempts
+                      WHERE task_id = %s
+                        AND attempt_number = %s
+                        AND status = 'running'
+                        AND worker_id = %s
+                  )
                 """,
-                (Json(payload), task["task_id"]),
+                (
+                    Json(payload),
+                    task["task_id"],
+                    worker_id,
+                    task["task_id"],
+                    task["attempts"],
+                    worker_id,
+                ),
             )
+            if cur.rowcount == 0:
+                _audit_invariant_violation(
+                    cur,
+                    worker_id,
+                    "task",
+                    str(task["task_id"]),
+                    "task_complete_rejected",
+                    {
+                        "workflow_id": str(task["workflow_id"]) if task["workflow_id"] else None,
+                        "step_id": str(task["step_id"]) if task["step_id"] else None,
+                        "task_id": str(task["task_id"]),
+                    },
+                )
+                return
             cur.execute(
                 """
                 UPDATE task_attempts
@@ -581,9 +740,21 @@ def _complete_task_and_advance(
                     ended_at = now()
                 WHERE task_id = %s
                   AND attempt_number = %s
+                  AND status = 'running'
+                  AND worker_id = %s
                 """,
-                (task["task_id"], task["attempts"]),
+                (task["task_id"], task["attempts"], worker_id),
             )
+            if cur.rowcount == 0:
+                _audit_invariant_violation(
+                    cur,
+                    worker_id,
+                    "task_attempt",
+                    str(task["task_id"]),
+                    "task_attempt_complete_rejected",
+                    {"task_id": str(task["task_id"]), "attempt": task["attempts"]},
+                )
+                return
             _audit(
                 cur,
                 worker_id,
@@ -619,7 +790,7 @@ def _complete_task_and_advance(
                     completed_at = now(),
                     updated_at = now()
                 WHERE step_id = %s
-                  AND status != 'completed'
+                  AND status = 'pending'
                 RETURNING step_key
                 """,
                 (task["step_id"],),
