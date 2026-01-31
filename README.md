@@ -132,6 +132,22 @@ This creates a research workflow, searches the web via Brave, reads source pages
 Baileys is a standalone WhatsApp Web bridge. It is not required for the system to run.
 
 **Warning:** Baileys is non-contractual and may break.
+## Architecture & Vision
+
+### Design Philosophy
+The system is built on the **Adapter Pattern**, allowing for modular, pluggable integration of:
+- **Skills (Tools)**: Web searching, content extraction, summarization, etc.
+- **Events (Signals)**: Inbound triggers from WhatsApp, calendar events, or notes.
+- **Steps & Flows**: Sequences of tasks that compose a higher-level objective.
+
+### Long-term Goal
+The architectural end goal is a fully autonomous agent that can:
+1. **Analyze Intents**: Leverage LLM reasoning to understand a complex request.
+2. **Dynamic Planning**: Check the available "Skill Registry" to determine which tools are required.
+3. **Assemble Flows**: Dynamically create a sequence of steps (functions) tailored to the specific goal.
+4. **Autonomous Execution**: Carry out the planned steps, using the output of one as the input for the next.
+
+This separation of concerns between **Planning (Orchestrator)** and **Execution (Worker)** is designed to support this evolution from hardcoded rules to dynamic, case-by-case reasoning.
 
 ### Start Baileys
 - Start only the sidecar: `docker compose up -d baileys`
