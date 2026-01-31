@@ -13,7 +13,12 @@ from .suggestions import RuleBasedSuggestionGenerator, SuggestionWriter
 from .approvals import Approval, ApprovalWriter
 from .messages import Message, MessageWriter
 from .messages.inbound import handle_inbound_text
-from .workflows import WorkflowFactory, WorkflowStepPlanner, plan_pending_workflows
+from .workflows import (
+    WorkflowFactory,
+    WorkflowStepPlanner,
+    plan_pending_workflows,
+    workflow_type_for_suggestion,
+)
 from .tasks import TaskPlanner, plan_pending_tasks
 
 import psycopg
@@ -290,9 +295,11 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                                 return
                             suggestion_type = row[4]
                             workflow_id = None
+                            workflow_type = None
                             if decision == "approved":
                                 factory = WorkflowFactory(actor_id="orchestrator")
                                 try:
+                                    workflow_type = workflow_type_for_suggestion(str(suggestion_type))
                                     workflow_id = factory.create_pending(
                                         cur, user_id=str(row[1]), suggestion_type=str(suggestion_type)
                                     )
@@ -306,7 +313,7 @@ def _make_handler(state: _ReadinessState) -> type[BaseHTTPRequestHandler]:
                                     planner.ensure_steps(
                                         cur,
                                         workflow_id=workflow_id,
-                                        workflow_type=str(row[4]),
+                                        workflow_type=str(workflow_type),
                                         workflow_status="pending",
                                     )
                                 except ValueError as exc:
