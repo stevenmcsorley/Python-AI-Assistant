@@ -41,18 +41,30 @@ docker logs -f pythonaiassistan-baileys-1
 
 Scan the QR code shown in the Baileys logs with WhatsApp to authenticate.
 
-### 3) Create a user and bind WhatsApp phone
+To enable real WhatsApp delivery, set:
+```
+WHATSAPP_PROVIDER=baileys
+```
+
+### 3) Configure DeepSeek (synthesize task)
+Set in your environment or `.env`:
+```
+DEEPSEEK_API_BASE=https://api.deepseek.com
+DEEPSEEK_API_KEY=your_key_here
+```
+
+### 4) Create a user and bind WhatsApp phone
 ```
 INSERT INTO users (user_id, whatsapp_phone, display_name, timezone, status)
 VALUES ('00000000-0000-0000-0000-000000000001', '+447900000000', 'Demo User', 'UTC', 'active');
 ```
 
-### 4) Trigger ingest
+### 5) Trigger ingest
 ```
 curl -X POST http://localhost:8000/ingest
 ```
 
-### 5) Approve via WhatsApp
+### 6) Approve via WhatsApp
 You will receive a `suggestion_ready` message. Reply:
 ```
 approve <suggestion_id>
@@ -65,7 +77,7 @@ curl -X POST http://localhost:8000/whatsapp \
   -d '{"from":"+447900000000","text":"approve <suggestion_id>"}'
 ```
 
-### 6) Result
+### 7) Result
 Once approved:
 - Workflow runs to completion
 - Obsidian draft note is created under `obsidian-vault/`

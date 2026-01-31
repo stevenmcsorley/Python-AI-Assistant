@@ -18,6 +18,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from .messages import Message, MessageWriter, deliver_queued_message
+from .messages.providers import BaileysProvider, DeliveryProvider, WhatsAppStubProvider
 from .llm import DeepSeekError, DeepSeekResponse, run_chat_completion
 
 REQUIRED_TABLES = ("tasks", "task_attempts", "audit_log")
@@ -133,6 +134,18 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         raise SystemExit(f"invalid integer for {name}: {value}")
+
+
+def _select_delivery_provider(logger: logging.Logger) -> DeliveryProvider:
+    provider_name = (os.getenv("WHATSAPP_PROVIDER") or "stub").strip().lower()
+    if provider_name == "baileys":
+        logger.info("message delivery provider: baileys")
+        return BaileysProvider()
+    if provider_name in ("stub", "whatsapp_stub", ""):
+        logger.info("message delivery provider: whatsapp_stub")
+        return WhatsAppStubProvider()
+    logger.warning("unknown WHATSAPP_PROVIDER '%s'; using whatsapp_stub", provider_name)
+    return WhatsAppStubProvider()
 
 
 def _configure_logging(service: str, worker_id: str) -> None:
@@ -1632,6 +1645,7 @@ def main() -> None:
     listen_port = _env_int("WORKER_PORT", 8001)
     readiness_interval = _env_int("READINESS_CHECK_SECONDS", 10)
     delivery_interval = _env_int("MESSAGE_DELIVERY_INTERVAL_SECONDS", 5)
+    delivery_provider = _select_delivery_provider(logger)
 
     stop_event = threading.Event()
     shutdown_requested = {"value": False}
@@ -1717,7 +1731,7 @@ def main() -> None:
         if readiness.get()[0] and now - last_delivery_check >= delivery_interval:
             if conn is not None:
                 try:
-                    deliver_queued_message(conn, worker_id)
+                    deliver_queued_message(conn, worker_id, delivery_provider)
                 except Exception as exc:
                     logger.error("message delivery failed: %s", exc)
             last_delivery_check = now
