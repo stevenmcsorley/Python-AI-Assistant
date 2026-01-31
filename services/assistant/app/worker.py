@@ -25,6 +25,7 @@ LEASE_DURATION_SECONDS = 120
 LEASE_RENEW_SECONDS = 30
 MAX_WEB_FETCH_BYTES = 256 * 1024
 WEB_FETCH_TIMEOUT_SECONDS = 5
+MAX_SYNTHESIS_INPUT_BYTES = 20000
 
 
 @dataclass(frozen=True)
@@ -900,41 +901,57 @@ def _elapsed_ms(start: float) -> int:
 
 
 def _collect_synthesis_inputs(conn: psycopg.Connection, task: dict) -> tuple[list[str], list[dict]]:
-    if task.get("step_id") is None:
+    if task.get("workflow_id") is None:
         return [], []
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            SELECT task_id, output_json
-            FROM tasks
-            WHERE step_id = %s
-              AND task_id != %s
-              AND status = 'completed'
-              AND output_json IS NOT NULL
-            ORDER BY created_at ASC
+            SELECT t.task_id, t.task_type, t.output_json, ws.step_key, ws.step_index
+            FROM tasks t
+            JOIN workflow_steps ws ON ws.step_id = t.step_id
+            WHERE t.workflow_id = %s
+              AND t.task_id != %s
+              AND t.status = 'completed'
+              AND t.output_json IS NOT NULL
+            ORDER BY ws.step_index ASC, t.created_at ASC
             """,
-            (task["step_id"], task["task_id"]),
+            (task["workflow_id"], task["task_id"]),
         )
         rows = cur.fetchall()
     input_task_ids = [str(row["task_id"]) for row in rows]
-    outputs = [row["output_json"] for row in rows]
-    return input_task_ids, outputs
+    inputs = [
+        {
+            "step_key": str(row["step_key"]),
+            "task_type": str(row["task_type"]),
+            "output": row["output_json"],
+        }
+        for row in rows
+    ]
+    return input_task_ids, inputs
 
 
 def _execute_synthesize_llm(
     conn: psycopg.Connection,
     task: dict,
     logger: logging.Logger,
-) -> tuple[dict | None, str | None, int]:
+) -> tuple[dict | None, str | None, int, int]:
     start = time.monotonic()
-    input_task_ids, outputs = _collect_synthesis_inputs(conn, task)
-    if not outputs:
-        return None, "missing_inputs", _elapsed_ms(start)
+    input_task_ids, inputs = _collect_synthesis_inputs(conn, task)
+    input_count = len(inputs)
+    if not inputs:
+        return None, "missing_inputs", _elapsed_ms(start), input_count
 
     try:
-        inputs_json = json.dumps(outputs, sort_keys=True)
+        payload = {
+            "workflow_id": str(task["workflow_id"]) if task.get("workflow_id") else None,
+            "inputs": inputs,
+        }
+        inputs_json = json.dumps(payload, sort_keys=True)
     except (TypeError, ValueError):
-        return None, "input_serialization_failed", _elapsed_ms(start)
+        return None, "input_serialization_failed", _elapsed_ms(start), input_count
+
+    if len(inputs_json.encode("utf-8")) > MAX_SYNTHESIS_INPUT_BYTES:
+        return None, "input_too_large", _elapsed_ms(start), input_count
 
     api_key = os.getenv("DEEPSEEK_API_KEY")
     api_base = os.getenv("DEEPSEEK_API_BASE")
@@ -942,11 +959,11 @@ def _execute_synthesize_llm(
         response: DeepSeekResponse = run_chat_completion(api_key, api_base, inputs_json)
     except DeepSeekError as exc:
         logger.error("deepseek request failed (task_id=%s reason=%s)", task["task_id"], exc.reason)
-        return None, exc.reason, _elapsed_ms(start)
+        return None, exc.reason, _elapsed_ms(start), input_count
 
     summary = response.summary.strip()
     if not summary:
-        return None, "empty_response", _elapsed_ms(start)
+        return None, "empty_response", _elapsed_ms(start), input_count
 
     output = {
         "model": "deepseek-chat",
@@ -957,7 +974,7 @@ def _execute_synthesize_llm(
             "completion": response.completion_tokens,
         },
     }
-    return output, None, _elapsed_ms(start)
+    return output, None, _elapsed_ms(start), input_count
 
 
 def _create_workflow_output(
@@ -1464,33 +1481,37 @@ def _process_task(conn: psycopg.Connection, worker_id: str, task: dict, logger: 
         logger.info("task completed (task_id=%s)", task["task_id"])
         return
 
-    if task_type == "synthesize":
-        output, failure_reason, duration_ms = _execute_synthesize_llm(conn, task, logger)
-        if failure_reason:
-            _mark_task_failed_only(
+        if task_type == "synthesize":
+            output, failure_reason, duration_ms, input_count = _execute_synthesize_llm(
+                conn, task, logger
+            )
+            if failure_reason:
+                _mark_task_failed_only(
+                    conn,
+                    worker_id,
+                    task,
+                    failure_reason,
+                    audit_metadata={
+                        "model": "deepseek-chat",
+                        "reason": failure_reason,
+                        "duration_ms": duration_ms,
+                        "input_count": input_count,
+                    },
+                )
+                logger.error("synthesize failed (task_id=%s reason=%s)", task["task_id"], failure_reason)
+                return
+            _complete_task_and_advance(
                 conn,
                 worker_id,
                 task,
-                failure_reason,
+                logger,
+                output_json=output,
                 audit_metadata={
                     "model": "deepseek-chat",
-                    "reason": failure_reason,
                     "duration_ms": duration_ms,
+                    "input_count": input_count,
                 },
             )
-            logger.error("synthesize failed (task_id=%s reason=%s)", task["task_id"], failure_reason)
-            return
-        _complete_task_and_advance(
-            conn,
-            worker_id,
-            task,
-            logger,
-            output_json=output,
-            audit_metadata={
-                "model": "deepseek-chat",
-                "duration_ms": duration_ms,
-            },
-        )
         logger.info("task completed (task_id=%s)", task["task_id"])
         return
 
